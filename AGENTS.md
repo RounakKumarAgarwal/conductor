@@ -256,6 +256,83 @@ Conductor:
 - **Tool execution**: Tools and MCP servers are managed by the `claude` CLI's own configuration. The provider rejects workflow-level `runtime.mcp_servers` at the factory and refuses any non-empty per-agent `tools:` list (workflow tool names do not translate to CLI tool IDs). An agent with `tools: []` runs with no tools; omitting `tools:` grants the full `claude_code` preset.
 - **Runtime config**: `temperature` and `max_tokens` are rejected at the factory — the CLI controls sampling behavior.
 
+#### `aca.py` parity notes
+
+The ACA (Azure Container Apps) provider (`aca.py`) is an **experimental**
+provider (issue #284) — see the "Experimental Providers" section below for
+the carve-out policy. Unlike `claude_agent_sdk.py`, which delegates the
+loop to a local CLI subprocess, `aca.py` delegates the **entire agentic
+loop to a remote sandbox**: `AcaRuntimeProvider` is a thin host-side
+transport shim that derives a session identifier, authenticates via
+`DefaultAzureCredential`, and relays NDJSON event frames from an
+in-container `conductor-agent-runner` (which itself wraps a real
+`CopilotProvider`) verbatim to `event_callback`. Because the runner
+re-emits Conductor's own event vocabulary and forwards a real
+`CopilotProvider`'s output, this achieves **full event and output
+parity** (`mcp_tools`, `streaming_events`, `agent_reasoning_events`, and
+`reasoning_effort` are all declared `True`) — with the following carve-outs:
+
+**Inner Copilot credential (DD4).** The sandbox's Copilot session can't do
+interactive OAuth, so the host resolves a credential per request and
+forwards it in-memory: `COPILOT_PROVIDER_BASE_URL` (BYOK) →
+`COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/`GITHUB_TOKEN` → **`gh auth token`** →
+`ProviderError`. The `gh` step (`_resolve_gh_cli_token`) is what makes the
+zero-setup path work and mirrors the Copilot CLI's own documented chain;
+every failure mode (not installed, not signed in, timeout, empty output)
+means "no token" and falls through rather than raising. Reading the
+Copilot editor plugins' `~/.config/github-copilot/auth.db` is
+**deliberately not implemented** — that store belongs to the Copilot
+Language Server (not the CLI/SDK the runner drives), has changed format
+twice, and is slated for encryption at rest. Note for tests: any test
+asserting the "no credential" error **must** stub the `gh` subprocess, or
+it will pick up the developer's real token (see
+`TestAcaCredentialPrecedence._clear_credential_env`).
+
+- **`workflow_tools_passthrough=False`**: the per-agent `tools:` allowlist
+  is forwarded to the runner in the request body, but the in-container
+  `CopilotProvider` it wraps never applies that list to the SDK session —
+  every tool/MCP server available to the session is callable regardless of
+  the declared allowlist. Combined with `mcp_tools=True` (the full
+  configured `mcp_servers` set is always forwarded), there is no allowlist
+  value the runner can honor — not even `tools: []` — so
+  `config/validator.py` rejects **any** explicit `tools:` on an
+  `aca`-backed agent, not just a non-empty one (review follow-up, #284
+  E7). This mirrors the same declared carve-out on `claude_agent_sdk.py`
+  and `hermes.py`, except those declare `mcp_tools=False` (nothing is ever
+  forwarded regardless of the list), so `tools: []` genuinely disables all
+  tools and stays valid for them.
+- **`working_dir=False`**: this capability field means "applies the
+  generic, host-resolved `agent.working_dir` / `runtime.working_dir`" — a
+  host filesystem path the engine resolves against the workflow file's
+  directory. `aca` never reads that field; it only honors the separate,
+  container-relative `sandbox.working_dir` block (documented in
+  `docs/providers/aca.md#workflow-configuration`), which has no meaning as
+  a host path and is not gated by this capability.
+- **`interrupt`/`max_session_seconds` are declared `True` host-side but
+  not fully backed by the shipped runner MVP (epic E4)**: the runner has
+  no `/interrupt` endpoint yet (the host's in-stream interrupt POST has
+  nowhere to land, so the host falls back to a best-effort session-delete
+  call, itself unsupported for custom-container pools, before giving up
+  waiting — not instantaneous; both cleanup calls use an explicit
+  10-second per-call timeout), and `max_session_seconds` enforcement is only a
+  best-effort, Copilot-internal timeout (the wrapped `CopilotProvider`'s
+  own `IdleRecoveryConfig` check) — there is no independent runner-level
+  guard. Stopping an `aca`-backed agent today eventually stops the host
+  from *waiting*, not the sandbox from *computing*. See
+  `docs/providers/aca.md#known-gaps-runner-mvp`.
+- **`checkpoint_resume=False`**: ACA dynamic-sessions sessions are
+  ephemeral with no volume mount, so there is nothing in-sandbox for
+  `conductor resume` to restore. A resumed workflow re-runs the
+  `aca`-backed agent from scratch rather than continuing an interrupted
+  sandbox session — the same posture `claude_agent_sdk.py` and `hermes.py`
+  declare, but for a different underlying reason (remote ephemeral
+  filesystem vs. local CLI process state).
+
+Full architecture, the runner `/execute`/`/health` contract, the NDJSON
+frame schema, and the credential/security model are documented in
+`docs/providers/aca.md` and the source design at
+`docs/projects/aca/aca-provider.design.md`.
+
 ### Experimental Providers
 
 Some providers delegate part of the agentic loop to an upstream SDK or

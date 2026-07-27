@@ -1,0 +1,1181 @@
+"""Azure Container Apps (ACA) dynamic-sessions runtime provider.
+
+This module provides ``AcaRuntimeProvider`` — a thin host-side transport
+shim implementing :class:`~conductor.providers.base.AgentProvider` that
+delegates agent execution to an in-sandbox ``conductor-agent-runner``
+process running inside an Azure Container Apps dynamic-sessions pool.
+
+The library is an optional dependency — install with:
+    pip install 'conductor-cli[aca]'
+(pins ``azure-identity`` plus ``azure-core[aio]`` — the latter supplies the
+``aiohttp``-based async transport the async ``DefaultAzureCredential`` in
+this module requires; ``azure-identity`` alone does not include one.)
+
+The transport shim (epic E3, issue #284) derives a session ``identifier``
+from ``identifier_scope`` (DD5), acquires a cached AAD bearer token, issues a
+single streaming ``POST {pool_endpoint}/execute`` request (Branch S, DD3),
+relays the runner's NDJSON event frames verbatim to ``event_callback``, and
+parses the terminal ``result`` frame into :class:`AgentOutput`. The
+in-sandbox ``conductor-agent-runner`` itself (epic E4) is not yet built —
+this module implements only the host side of the contract defined in
+:mod:`conductor.providers.aca_protocol`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets
+import subprocess
+import time
+from typing import TYPE_CHECKING, Any
+
+import httpx
+from pydantic import SecretStr
+
+from conductor.exceptions import ProviderError
+from conductor.providers.aca_protocol import (
+    AcaAgentPayload,
+    AcaErrorData,
+    AcaExecuteRequest,
+    AcaResultData,
+)
+from conductor.providers.base import AgentOutput, AgentProvider, EventCallback
+from conductor.providers.capabilities import ProviderCapabilities
+from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
+
+if TYPE_CHECKING:
+    from conductor.config.schema import AgentDef, ProviderSettings, ToolOutputConfig
+
+logger = logging.getLogger(__name__)
+
+# azure-identity ships DefaultAzureCredential, used to acquire a
+# dynamicsessions.io bearer token for the Session Executor role (FR6). It is
+# gated behind the `aca` extra (pyproject.toml) rather than a base
+# dependency, mirroring the anthropic/hermes-agent/claude-agent-sdk optional
+# SDK guards elsewhere in this package. The sync `DefaultAzureCredential` is
+# kept as the availability-check import (existing E2 tests patch
+# `AZURE_IDENTITY_AVAILABLE` directly); the async variant
+# (`azure.identity.aio`) is what the provider actually calls at runtime, since
+# blocking the event loop on a sync `get_token()` inside an async provider
+# would stall every other concurrent agent.
+try:
+    from azure.identity import DefaultAzureCredential  # ty: ignore[unresolved-import]
+    from azure.identity.aio import (  # ty: ignore[unresolved-import]
+        DefaultAzureCredential as _AsyncDefaultAzureCredential,
+    )
+
+    AZURE_IDENTITY_AVAILABLE = True
+except ImportError:
+    AZURE_IDENTITY_AVAILABLE = False
+    DefaultAzureCredential: Any = None
+    _AsyncDefaultAzureCredential: Any = None
+
+
+# Audience for the Session Executor role (FR6, Security Considerations).
+_DYNAMICSESSIONS_SCOPE = "https://dynamicsessions.io/.default"
+
+# Fallback management-API version when the workflow YAML doesn't pin one.
+_DEFAULT_API_VERSION = "2025-07-01"
+
+# ACA session identifiers must fit this bound (Data Flow: "truncated to
+# ≤128 chars with a hash suffix").
+_MAX_IDENTIFIER_LENGTH = 128
+
+# Charset-normalization: anything outside lowercase-alnum-hyphen collapses to
+# a single hyphen (Data Flow: "charset-normalized").
+_IDENTIFIER_INVALID_RE = re.compile(r"[^a-z0-9-]+")
+
+# Refresh the cached AAD token this many seconds before its reported expiry,
+# so a request never starts with a token that expires mid-flight.
+_TOKEN_REFRESH_MARGIN_SECONDS = 60.0
+
+# Upper bound on the `gh auth token` subprocess (DD4 step 3). `gh` reads a
+# local config/keyring and normally returns in well under a second; the
+# timeout only exists so a wedged keyring prompt (e.g. a locked libsecret
+# store on a headless host) degrades to "no token" instead of hanging the
+# workflow before its first agent turn.
+_GH_TOKEN_TIMEOUT_SECONDS = 10.0
+
+# `AcaErrorData.message`'s placeholder, read off the model so the two can't
+# drift. Used to detect "the body told us nothing" and fall back to echoing
+# the raw response body instead.
+_DEFAULT_ACA_ERROR_MESSAGE = AcaErrorData.model_fields["message"].default
+
+# How much of an unrecognized error body to echo into the ProviderError
+# message — enough to identify an ACA front-end error page or JSON payload
+# without dumping a full HTML document into the terminal.
+_MAX_ERROR_BODY_CHARS = 500
+
+
+def _clean_env(name: str) -> str | None:
+    """Read an environment variable, normalizing unset/whitespace-only
+    values to ``None`` (review fix, DD4 precedence).
+
+    Without this, a stray blank export (e.g. ``COPILOT_PROVIDER_BASE_URL=""``
+    or ``"  "`` left over from an unset CI secret) would be treated as
+    "configured" — either selecting the BYOK branch with a garbage
+    ``base_url`` or, for a stripped-empty *token*, suppressing a valid
+    lower-priority credential that should have been tried instead. Mirrors
+    the same normalize-then-validate discipline used for
+    ``COPILOT_PROVIDER_RUNTIME_URL``/``_TOKEN`` in ``copilot.py``.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _resolve_gh_cli_token() -> SecretStr | None:
+    """Best-effort ``gh auth token`` lookup for the inner Copilot credential.
+
+    Last step of the DD4 precedence chain, and the reason a workflow can run
+    with **zero** ACA-specific credential setup: GitHub documents ``gh``'s
+    OAuth token as a supported Copilot credential source (``copilot login
+    --help`` lists "OAuth tokens from the GitHub CLI (gh) app"), and most
+    operators are already signed in.
+
+    Every failure mode means the same thing — "no token from this source" —
+    and is swallowed so the caller falls through to a single, actionable
+    "no credential configured" error instead of leaking a subprocess
+    exception from inside credential resolution:
+
+    - ``FileNotFoundError``: ``gh`` isn't installed.
+    - non-zero exit: installed but not logged in (or the host is unknown).
+    - ``TimeoutExpired``: a wedged keyring/credential-helper prompt.
+    - empty stdout: logged in but no token available for the active account.
+
+    ``OSError`` covers the residual exec failures (e.g. ``PermissionError``
+    on a non-executable ``gh`` on ``PATH``). The token is returned as a
+    ``SecretStr`` and is never logged — only *which source won* is logged.
+
+    Caveats worth knowing (documented, not enforced here): ``gh`` tokens are
+    user OAuth tokens subject to SAML SSO authorization and org OAuth-app
+    restrictions, and a GHEC-with-data-residency host needs an explicit
+    ``gh auth token --hostname``.
+    """
+    try:
+        completed = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=_GH_TOKEN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # OSError covers `gh` being absent (FileNotFoundError) or not
+        # executable (PermissionError); SubprocessError covers TimeoutExpired.
+        logger.debug("aca: `gh auth token` unavailable (%s)", type(exc).__name__)
+        return None
+    if completed.returncode != 0:
+        logger.debug("aca: `gh auth token` exited %d (not signed in?)", completed.returncode)
+        return None
+    token = (completed.stdout or "").strip()
+    if not token:
+        logger.debug("aca: `gh auth token` returned no token")
+        return None
+    logger.debug("aca: resolved inner Copilot credential from `gh auth token`")
+    return SecretStr(token)
+
+
+class AcaRuntimeProvider(AgentProvider):
+    """Host-side transport shim for the ``aca`` (Azure Container Apps) provider.
+
+    Owns no agentic logic itself: it derives a session ``identifier``,
+    authenticates against the dynamic-sessions pool, and relays the
+    in-sandbox runner's NDJSON event stream verbatim to ``event_callback``,
+    parsing the terminal ``result`` frame into :class:`AgentOutput`.
+
+    Requires the ``azure-identity`` package:
+        pip install 'conductor-cli[aca]'
+
+    Example:
+        >>> provider = AcaRuntimeProvider(provider_settings=settings)
+        >>> await provider.close()
+    """
+
+    CAPABILITIES = ProviderCapabilities(
+        tier="experimental",
+        # Full `runtime.mcp_servers` is forwarded to the runner, which wraps
+        # a real `CopilotProvider` in-container (runner-image contract).
+        mcp_tools=True,
+        # The per-agent `tools:` allowlist is forwarded to the runner in the
+        # request body, but the in-container `CopilotProvider` it wraps
+        # never applies that list to the SDK session (no filtering of which
+        # MCP servers/tools the model can call) — the same gap exists for
+        # every host-side `CopilotProvider` execution today. Declaring this
+        # `False` matches the actual, observed behavior rather than the
+        # aspirational runner-image contract; this is one of the allowed
+        # experimental carve-outs (see the Experimental Providers policy).
+        workflow_tools_passthrough=False,
+        # Branch S (single streaming request, #312) relays event frames
+        # incrementally as the runner emits them.
+        streaming_events=True,
+        # The runner forwards reasoning frames from the inner provider.
+        agent_reasoning_events=True,
+        # The inner provider (Copilot) translates reasoning effort natively.
+        reasoning_effort=("low", "medium", "high", "xhigh", "max"),
+        # Inherits the real CopilotProvider's prompt-injection schema
+        # enforcement — Copilot has no native JSON mode.
+        structured_output="prompt_injection",
+        # Real interrupt via the in-flight stream (Branch S); a best-effort
+        # local hard-abort remains available as a fallback.
+        interrupt=True,
+        # Enforced by a runner-side wall-clock guard (the default `Timed`
+        # lifecycle does not honor the pool's `maxAlivePeriodInSeconds`).
+        max_session_seconds=True,
+        # Sessions are ephemeral with no volume mount; `conductor resume`
+        # re-runs the agent rather than restoring in-sandbox state.
+        checkpoint_resume=False,
+        # The runner returns token counts on the terminal result frame.
+        usage_tracking=True,
+        # Honest via the mandatory concurrency discriminator in the
+        # identifier derivation (DD5).
+        concurrent_safe=True,
+        # This capability field means "applies the generic, host-resolved
+        # `agent.working_dir` / `runtime.working_dir`" (see
+        # ProviderCapabilities.working_dir) — a host filesystem path the
+        # engine resolves against the workflow file's directory. `aca`
+        # never reads that field: `_build_request` only forwards the
+        # separate, container-relative `sandbox.working_dir` (see the
+        # `sandbox:` block docs). Mixing the two would be actively wrong —
+        # a host path has no meaning inside the sandbox filesystem — so
+        # this is declared `False` rather than pretending to honor it.
+        working_dir=False,
+        upstream_pin="azure-identity>=1.19.0",
+        maintainer=None,
+    )
+
+    def __init__(
+        self,
+        provider_settings: ProviderSettings,
+        mcp_servers: dict[str, Any] | None = None,
+        default_model: str | None = None,
+        max_agent_iterations: int | None = None,
+        default_reasoning_effort: ReasoningEffort | None = None,
+        max_session_seconds: float | None = None,
+        tool_output: ToolOutputConfig | None = None,
+    ) -> None:
+        """Initialize the ACA runtime provider.
+
+        Args:
+            provider_settings: Structured ``runtime.provider`` settings with
+                ``name="aca"``. Carries ``pool_endpoint``, ``api_version``,
+                ``inner_provider``, ``identifier_scope``, ``egress``,
+                ``lifecycle``, and ``auth`` — the only place these
+                ``aca``-only fields live (see :class:`ProviderSettings`).
+            mcp_servers: MCP server configurations forwarded to the runner.
+            default_model: Default model for agents that don't specify one.
+            max_agent_iterations: Maximum tool-use iterations per execution.
+            default_reasoning_effort: Workflow-wide default reasoning effort.
+            max_session_seconds: Maximum wall-clock duration for agent
+                sessions, enforced runner-side.
+            tool_output: MCP tool result output-size configuration.
+
+        Raises:
+            ProviderError: If the ``azure-identity`` package is not
+                installed.
+        """
+        if not AZURE_IDENTITY_AVAILABLE:
+            raise ProviderError(
+                "aca provider requires the azure-identity package",
+                suggestion="Install with: uv add 'conductor-cli[aca]'",
+            )
+
+        self._provider_settings = provider_settings
+        self._mcp_servers = mcp_servers
+        self._default_model = default_model
+        self._default_max_agent_iterations = max_agent_iterations
+        self._default_reasoning_effort = default_reasoning_effort
+        self._default_max_session_seconds = max_session_seconds
+        self._tool_output_config = tool_output
+
+        # Per-run random salt (E3-T1) mixed into every derived identifier so
+        # two workflow runs never collide even for identical agent/context —
+        # see `identifier_for` / Data Flow "generated with a cryptographic
+        # salt". 4 bytes (8 hex chars) is ample entropy for a routing key
+        # that is never guessable-security-critical on its own (the pool
+        # endpoint + AAD auth is the actual access boundary).
+        self._run_salt = secrets.token_hex(4)
+
+        # Lazily constructed: an httpx client owns real sockets, and the AAD
+        # credential owns its own transport, so neither is created until
+        # first use (e.g. a `conductor validate` capability lookup never
+        # touches either).
+        self._http_client: httpx.AsyncClient | None = None
+        self._credential: Any = None
+        self._cached_token: str | None = None
+        self._cached_token_expires_at: float = 0.0
+
+        # `identifier_scope: "none"` needs a fresh workspace on *every* call
+        # (Data Flow: "fresh workspace every execution, including retries");
+        # this monotonic counter is what makes that scope diverge even for
+        # otherwise-identical agent/context pairs.
+        self._none_scope_counter = 0
+
+        # In-flight registry keyed by the *logical* identifier returned from
+        # `identifier_for` (review fix, OQ#1). Maps each logical identifier
+        # to the set of concurrency *slot numbers* (not a count) currently
+        # reserved for it, so `execute()` can append a discriminator only
+        # when genuinely concurrent, and release exactly the slot it
+        # acquired regardless of completion order — see
+        # `_acquire_wire_identifier`.
+        self._active_identifiers: dict[str, set[int]] = {}
+
+    # ------------------------------------------------------------------
+    # Identifier derivation (E3-T3, DD5, OQ#1)
+    # ------------------------------------------------------------------
+
+    def identifier_for(self, agent: AgentDef, context: dict[str, Any]) -> str:
+        """Derive the *logical* ACA session identifier for this execution.
+
+        Implements the Data Flow formula
+        ``cond-{run_salt}-{scope_key}{concurrency_suffix}``: ``scope_key``
+        comes from the effective ``identifier_scope`` (per-agent
+        ``sandbox.identifier_scope`` override, else the workflow-wide
+        default), and the concurrency discriminator is appended whenever a
+        for-each loop signal (``_key`` when ``key_by`` is set, else
+        ``_index``) is present in ``context``.
+
+        This is the *reuse* key described by the Data Flow table — calling
+        it twice for the same agent/context always returns the same string,
+        which is what makes sequential re-executions (loop-backs, retries,
+        sequential ``for_each`` iterations of a different agent under
+        ``identifier_scope: workflow``) share one sandbox workspace.
+
+        **OQ#1 decision.** The design's *Data Flow* mandates a discriminator
+        for "any concurrent unit", but this function's only per-call signal
+        is ``context`` — the for-each loop key, when present. A ``parallel``
+        group carries no such signal at all, and scopes other than the
+        default ``agent``/``item`` don't already vary ``scope_key`` by agent
+        name, so relying on this function alone is not sufficient to keep
+        concurrent siblings from colliding (e.g. two members of a `parallel`
+        group under `identifier_scope: workflow` would otherwise resolve to
+        the *same* logical identifier). Rather than change the `execute()`
+        contract (ruled out by this epic's acceptance criteria),
+        `execute()` layers a runtime in-flight registry on top of this
+        logical identifier (`_acquire_wire_identifier`/
+        `_release_wire_identifier`): it only diverges the identifier
+        actually sent over the wire when another call sharing this same
+        logical identifier is genuinely in flight *right now*, and reuses it
+        otherwise — satisfying both halves of the Data Flow contract
+        (sequential reuse, concurrent divergence) with no engine-visible
+        change.
+
+        The result is charset-normalized (lowercase alphanumeric + hyphen)
+        and truncated to ``_MAX_IDENTIFIER_LENGTH`` chars with an
+        unconditional hash suffix so two distinct raw identifiers never
+        collide after normalization/truncation.
+        """
+        scope = self._resolve_identifier_scope(agent)
+        scope_key = self._scope_key(scope, agent, context)
+        parts = [f"cond-{self._run_salt}", scope_key]
+
+        # `item` scope already folds the loop key into `scope_key`, so
+        # appending it again as a discriminator would just duplicate it.
+        if scope != "item":
+            discriminator = self._concurrency_discriminator(context)
+            if discriminator:
+                parts.append(discriminator)
+
+        if scope == "none":
+            self._none_scope_counter += 1
+            parts.append(str(self._none_scope_counter))
+
+        return self._normalize_and_truncate("-".join(parts))
+
+    def _acquire_wire_identifier(self, logical_id: str) -> tuple[str, int]:
+        """Reserve the identifier actually sent to ACA for this call.
+
+        Tracks the *set* of slot numbers currently reserved for
+        `logical_id` in `self._active_identifiers` — not merely a count.
+        Slot `0` always maps to `logical_id` unchanged (preserving
+        sequential reuse); a call that arrives while another call sharing
+        this same `logical_id` hasn't released its slot yet (i.e. genuinely
+        concurrent, per OQ#1) is assigned the smallest unused slot number
+        instead, so `concurrent_safe=True` stays honest even under
+        `identifier_scope: workflow` (whose `scope_key` alone does not vary
+        by agent name) and for `parallel`-group members (which never carry a
+        `context` loop-key signal at all).
+
+        Using a *count* here (rather than a set of reserved slots) would be
+        unsafe under out-of-order completion: if call A reserves slot 0 and
+        call B reserves slot 1 while A is still in flight, then A finishes
+        and releases first, a naive count would let a subsequent call C
+        collide with B's still-active slot 1 (i.e. `count == 1` again,
+        producing the same `-conc1` suffix as B). Tracking the actual
+        reserved slot numbers means C instead gets the smallest number *not
+        in the active set* (slot 0, freed by A) — never colliding with B.
+
+        Must be paired with a matching `_release_wire_identifier(logical_id,
+        slot)` call (typically in a `finally` block) once the request this
+        identifier was used for has completed, passing back the exact
+        `slot` this call returned.
+        """
+        used_slots = self._active_identifiers.setdefault(logical_id, set())
+        slot = 0
+        while slot in used_slots:
+            slot += 1
+        used_slots.add(slot)
+        if slot == 0:
+            return logical_id, slot
+        return self._normalize_and_truncate(f"{logical_id}-conc{slot}"), slot
+
+    def _release_wire_identifier(self, logical_id: str, slot: int) -> None:
+        """Release the specific `slot` reserved by `_acquire_wire_identifier`."""
+        used_slots = self._active_identifiers.get(logical_id)
+        if used_slots is None:
+            return
+        used_slots.discard(slot)
+        if not used_slots:
+            self._active_identifiers.pop(logical_id, None)
+
+    def _resolve_identifier_scope(self, agent: AgentDef) -> str:
+        """Per-agent ``sandbox.identifier_scope`` wins over the workflow default."""
+        if agent.sandbox is not None and agent.sandbox.identifier_scope is not None:
+            return agent.sandbox.identifier_scope
+        return self._provider_settings.identifier_scope or "agent"
+
+    def _scope_key(self, scope: str, agent: AgentDef, context: dict[str, Any]) -> str:
+        if scope == "workflow":
+            # Constant across the whole run — `run_salt` already makes this
+            # unique per *run*; every agent in this workflow shares it.
+            return "workflow"
+        if scope == "item":
+            item_key = context.get("_key", context.get("_index"))
+            if item_key is None:
+                # No active for-each loop context — degrade to per-agent
+                # reuse rather than raising (an `identifier_scope: item`
+                # agent that isn't inside a for_each is a config oddity,
+                # not an execution error).
+                return agent.name
+            return str(item_key)
+        # "agent" (default) and "none" both key off the agent name; "none"'s
+        # per-call uniqueness comes from `_none_scope_counter` instead.
+        return agent.name
+
+    def _concurrency_discriminator(self, context: dict[str, Any]) -> str:
+        """Mandatory concurrency discriminator (DD5) — see OQ#1 in `identifier_for`."""
+        key = context.get("_key")
+        if key is not None:
+            return str(key)
+        index = context.get("_index")
+        if index is not None:
+            return str(index)
+        return ""
+
+    def _normalize_and_truncate(self, raw: str) -> str:
+        """Charset-normalize ``raw`` and bound it to the ACA identifier limit.
+
+        The digest is computed from ``raw`` (*before* normalization) and
+        appended **unconditionally**, not only when the body is too long.
+        ``_IDENTIFIER_INVALID_RE`` collapses every run of non
+        ``[a-z0-9-]`` characters to a single hyphen, which is lossy: two
+        distinct raw identifiers that differ only in the characters being
+        collapsed (e.g. agent names ``"foo_bar"`` and ``"foo.bar"``, or
+        ``"foo bar"`` and ``"foo-bar"``) would otherwise normalize to the
+        *same* string and collide on the ACA session identifier — silently
+        merging two logically distinct sessions. Mixing in a hash of the
+        pre-normalization input guarantees distinct raw inputs stay distinct
+        after normalization, regardless of collapsing.
+        """
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        normalized = _IDENTIFIER_INVALID_RE.sub("-", raw.lower()).strip("-")
+        if not normalized:
+            normalized = "cond"
+        prefix_len = _MAX_IDENTIFIER_LENGTH - len(digest) - 1
+        return f"{normalized[:prefix_len]}-{digest}"
+
+    @property
+    def _health_identifier(self) -> str:
+        """Stable per-run identifier for `/health` probes.
+
+        Every request the container-path-forwarding proxy forwards —
+        `/health` included — requires an `identifier` query parameter so ACA
+        knows which session to route to (auto-allocating one if it doesn't
+        exist yet). `validate_connection()` has no `agent`/`context` to
+        derive one from, so this uses a fixed, run-scoped identifier instead.
+        """
+        return self._normalize_and_truncate(f"cond-{self._run_salt}-health")
+
+    # ------------------------------------------------------------------
+    # AAD auth (E3-T4)
+    # ------------------------------------------------------------------
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            # `read=None`: the streaming `/execute` response can legitimately
+            # stay open for the ~30-minute per-request cap measured by the
+            # Phase 0 spike (DD3); the runner-side `max_session_seconds`
+            # guard and ACA's own platform cap are what actually bound
+            # duration. Short calls (`/health`, interrupt, session delete)
+            # pass their own per-request timeout override.
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+            )
+        return self._http_client
+
+    async def _get_access_token(self) -> str:
+        """Acquire (and cache) a ``dynamicsessions.io`` bearer token.
+
+        Uses the async ``azure.identity.aio.DefaultAzureCredential`` so
+        token acquisition never blocks the event loop (FR6).
+        """
+        now = time.time()
+        if self._cached_token is not None and now < (
+            self._cached_token_expires_at - _TOKEN_REFRESH_MARGIN_SECONDS
+        ):
+            return self._cached_token
+        if self._credential is None:
+            self._credential = _AsyncDefaultAzureCredential()  # ty: ignore[call-non-callable]
+        token = await self._credential.get_token(_DYNAMICSESSIONS_SCOPE)
+        self._cached_token = token.token
+        self._cached_token_expires_at = float(token.expires_on)
+        return self._cached_token
+
+    def _build_url(self, path: str) -> str:
+        base = (self._provider_settings.pool_endpoint or "").rstrip("/")
+        return f"{base}/{path}"
+
+    @property
+    def _api_version(self) -> str:
+        return self._provider_settings.api_version or _DEFAULT_API_VERSION
+
+    # ------------------------------------------------------------------
+    # Request construction (DD4 credential precedence, epic E8)
+    # ------------------------------------------------------------------
+
+    def _resolve_github_token(self) -> SecretStr | None:
+        """Source a GitHub token for Copilot capacity, wrapped in ``SecretStr``.
+
+        Precedence (DD4): ``COPILOT_GITHUB_TOKEN`` → ``GH_TOKEN`` →
+        ``GITHUB_TOKEN`` → ``gh auth token`` — first non-empty
+        (post-``strip()``) wins, via ``_clean_env`` (review fix: a
+        whitespace-only value no longer counts as "set", which would
+        otherwise suppress a valid lower-priority var). This mirrors the
+        Copilot CLI's *own* documented credential chain (env vars, then its
+        stored OAuth token, then a ``gh`` CLI fallback), so an operator
+        already signed in with ``gh`` needs no ACA-specific setup at all.
+
+        The ``gh`` fallback exists because the sandbox's inner Copilot
+        session cannot perform interactive OAuth inside a headless
+        container, so *something* host-side has to produce a token; reusing
+        the one the operator already has beats requiring a hand-created PAT
+        for every run. Deliberately **not** implemented: reading the Copilot
+        editor plugins' credential store (``~/.config/github-copilot/auth.db``).
+        That store belongs to the Copilot Language Server rather than the
+        CLI/SDK this provider drives, has changed format twice, and is
+        slated to be encrypted at rest — see
+        ``docs/projects/aca/aca-provider.design.md`` (DD4).
+
+        Wrapping in ``SecretStr`` immediately on read keeps the value
+        redacted in any incidental repr/str of the resolved credential;
+        callers must explicitly call ``get_secret_value()`` to obtain the
+        plaintext, mirroring the ``ProviderSettings.api_key`` /
+        ``bearer_token`` pattern in ``copilot.py``. Returns ``None`` when
+        no source yields a token.
+        """
+        for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+            value = _clean_env(var)
+            if value is not None:
+                logger.debug("aca: resolved inner Copilot credential from %s", var)
+                return SecretStr(value)
+        return _resolve_gh_cli_token()
+
+    def _resolve_inner_provider_settings(self) -> dict[str, Any]:
+        """Resolve the credential to forward to the runner's inner Copilot
+        provider (DD4, epic E8 — supersedes the OQ#6 Phase 1 stopgap).
+
+        The ``aca``-scoped ``ProviderSettings`` fields intentionally exclude
+        ``bearer_token``/``api_key``/``base_url`` (those stay copilot-only,
+        ``_check_field_compatibility``), so this reads environment variables
+        directly and forwards them so the runner can construct
+        ``ProviderSettings(name=inner_provider, **inner_provider_settings)``
+        for its inner ``CopilotProvider`` instead of attempting an
+        impossible interactive OAuth flow inside a headless sandbox.
+
+        Precedence mirrors the Copilot CLI's own auth resolution — no
+        ``credential_mode`` switch:
+
+        1. ``COPILOT_PROVIDER_BASE_URL`` set (non-whitespace, via
+           ``_clean_env``) → forward BYOK custom-routing settings unchanged
+           (``base_url`` + optional ``COPILOT_PROVIDER_API_KEY`` /
+           ``COPILOT_PROVIDER_BEARER_TOKEN``) — the same env vars the
+           Copilot custom-routing resolver reads
+           (``copilot.py:_resolve_sdk_provider_config``). ``base_url`` wins
+           even when a GitHub token is also present.
+        2. Otherwise, source a GitHub token (`_resolve_github_token`) — env
+           vars first, then a best-effort ``gh auth token`` — and forward it
+           as ``github_token`` so the runner's inner ``CopilotProvider``
+           authenticates against GitHub Copilot's own model routing — the
+           operator's Copilot capacity.
+        3. Neither resolves → fail loudly rather than run the sandbox
+           unauthenticated or silently degraded.
+
+        Acceptable only for **trusted use** (DD4) — the plaintext credential
+        travels in the request body to the runner.
+
+        Review fix: every secret value (``api_key``/``bearer_token``/
+        ``github_token``) is stored as a ``SecretStr`` instance in the
+        returned dict, not the plaintext ``str``. ``AcaExecuteRequest``'s
+        ``inner_provider_settings`` field is ``dict[str, Any]``, so pydantic
+        still recognizes and redacts these values (``"**********"``) in
+        ``model_dump``/``repr``/logging — only the dedicated wire-serialization
+        step in :meth:`execute` (``_wire_body``) unwraps them to plaintext,
+        right before the request bytes leave the process. A second
+        review fix — ``AcaExecuteRequest._redact_inner_provider_secrets`` —
+        additionally enforces this ``SecretStr`` wrapping for any
+        construction path that does *not* go through this method (e.g. a
+        raw dict/JSON payload passed to ``model_validate``), so redaction
+        does not depend solely on every caller using this helper.
+
+        Raises:
+            ProviderError: when no credential of either kind is configured.
+        """
+        base_url = _clean_env("COPILOT_PROVIDER_BASE_URL")
+        if base_url is not None:
+            settings: dict[str, Any] = {"base_url": base_url}
+            api_key = _clean_env("COPILOT_PROVIDER_API_KEY")
+            bearer_token = _clean_env("COPILOT_PROVIDER_BEARER_TOKEN")
+            if api_key is not None:
+                settings["api_key"] = SecretStr(api_key)
+            if bearer_token is not None:
+                settings["bearer_token"] = SecretStr(bearer_token)
+            return settings
+
+        github_token = self._resolve_github_token()
+        if github_token is not None:
+            return {"github_token": github_token}
+
+        raise ProviderError(
+            "aca: no credential available for the sandbox's inner Copilot "
+            "provider. Either sign in to GitHub on this host to run on your "
+            "own Copilot capacity, or configure a BYOK custom-routing endpoint.",
+            suggestion=(
+                "Run `gh auth login` (the token is picked up automatically), or "
+                "create a fine-grained 'Copilot Requests' PAT and export it as "
+                "COPILOT_GITHUB_TOKEN (GH_TOKEN / GITHUB_TOKEN also work), or "
+                "set COPILOT_PROVIDER_BASE_URL (plus COPILOT_PROVIDER_API_KEY / "
+                "COPILOT_PROVIDER_BEARER_TOKEN) to route the sandbox at a BYOK "
+                "endpoint."
+            ),
+            provider_name="aca",
+            is_retryable=False,
+        )
+
+    def _serialize_mcp_servers(self) -> dict[str, Any] | None:
+        if not self._mcp_servers:
+            return None
+        result: dict[str, Any] = {}
+        for name, cfg in self._mcp_servers.items():
+            result[name] = cfg.model_dump(mode="json") if hasattr(cfg, "model_dump") else cfg
+        return result
+
+    def _build_request(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        tools: list[str] | None,
+    ) -> AcaExecuteRequest:
+        reasoning_effort = resolve_reasoning_effort(agent, self._default_reasoning_effort)
+        working_dir = agent.sandbox.working_dir if agent.sandbox is not None else None
+        output_schema = (
+            {name: field.model_dump(exclude_none=True) for name, field in agent.output.items()}
+            if agent.output
+            else None
+        )
+        agent_payload = AcaAgentPayload(
+            name=agent.name,
+            model=agent.model or self._default_model,
+            system_prompt=agent.system_prompt,
+            output=output_schema,
+            max_agent_iterations=agent.max_agent_iterations or self._default_max_agent_iterations,
+            max_session_seconds=agent.max_session_seconds or self._default_max_session_seconds,
+            reasoning_effort=reasoning_effort,
+            working_dir=working_dir,
+            retry=agent.retry.model_dump(mode="json") if agent.retry is not None else None,
+            context_tier=agent.context_tier,
+        )
+        return AcaExecuteRequest(
+            agent=agent_payload,
+            rendered_prompt=rendered_prompt,
+            tools=tools,
+            mcp_servers=self._serialize_mcp_servers(),
+            context=context,
+            inner_provider=self._provider_settings.inner_provider or "copilot",
+            inner_provider_settings=self._resolve_inner_provider_settings(),
+            tool_output=(
+                self._tool_output_config.model_dump(mode="json")
+                if self._tool_output_config is not None
+                else None
+            ),
+        )
+
+    def _wire_body(self, request: AcaExecuteRequest) -> dict[str, Any]:
+        """Serialize `request` into the JSON body actually sent to the runner.
+
+        Review fix: `request.model_dump(mode="json")` alone keeps any
+        `SecretStr` values held in `inner_provider_settings` redacted
+        (`"**********"`) — the correct behavior for anything that logs,
+        reprs, or otherwise dumps the request object itself (including the
+        request's own `__repr__`). This method is the one dedicated
+        wire-serialization step that unwraps those secrets back to
+        plaintext, reading them directly off `request.inner_provider_settings`
+        (not off the already-redacted dump) immediately before the bytes are
+        handed to httpx — nowhere else in the codebase sees the plaintext.
+        """
+        body = request.model_dump(mode="json")
+        if request.inner_provider_settings is not None:
+            body["inner_provider_settings"] = {
+                key: value.get_secret_value() if isinstance(value, SecretStr) else value
+                for key, value in request.inner_provider_settings.items()
+            }
+        return body
+
+    # ------------------------------------------------------------------
+    # Error classification (E3-T5)
+    # ------------------------------------------------------------------
+
+    def _error_from_frame(self, data: dict[str, Any]) -> ProviderError:
+        parsed = AcaErrorData.model_validate(data)
+        return self._provider_error_from_parts(parsed)
+
+    async def _error_from_response(self, response: httpx.Response) -> ProviderError:
+        """Build a `ProviderError` from a non-2xx response body.
+
+        Review fix: a response opened via `client.stream()` (the `/execute`
+        path) has an unread body — calling `.json()` directly raises
+        `httpx.ResponseNotRead` (an `httpx.HTTPError` subclass), which the
+        `execute()` caller's `except httpx.HTTPError` clause then swallowed
+        into a generic "transport error" message, discarding the real ACA
+        `code`/`message`/`traceId`. `.aread()` buffers the body first; it is
+        a no-op on a response that was already fully read (e.g. the
+        non-streaming `client.get()`/`client.post()` callers), so this is
+        safe for every call site.
+
+        Second fix (functional test, issue #284): an ACA data-plane error
+        whose body carries *no* recognizable ``message`` (e.g. an HTTP 429
+        emitted by the pool's own front end rather than the runner) fell
+        back to ``AcaErrorData``'s placeholder default, so the operator saw
+        only "aca runner reported an error" with the real body discarded —
+        actively misleading, since the runner may never have been reached.
+        The raw body is now preserved (truncated) whenever the parsed
+        message is just that default, so there is always *something*
+        diagnosable.
+        """
+        await response.aread()
+        # Defensive: this method runs while constructing an error, so it must
+        # never raise on its own — an exception here would mask the failure
+        # the caller is actually trying to report.
+        raw_body = (getattr(response, "text", "") or "").strip()
+        try:
+            body = response.json()
+        except (json.JSONDecodeError, ValueError):
+            body = {}
+        error_obj = body.get("error", body) if isinstance(body, dict) else {}
+        parsed = (
+            AcaErrorData.model_validate(error_obj)
+            if isinstance(error_obj, dict)
+            else AcaErrorData()
+        )
+        return self._provider_error_from_parts(
+            parsed, status_code=response.status_code, raw_body=raw_body
+        )
+
+    def _provider_error_from_parts(
+        self,
+        error: AcaErrorData,
+        status_code: int | None = None,
+        raw_body: str | None = None,
+    ) -> ProviderError:
+        message = error.message
+        # Only append the raw body when parsing produced nothing better than
+        # the placeholder default — otherwise the ACA-shaped `message` is
+        # already the best description and duplicating the body just adds noise.
+        if raw_body and message == _DEFAULT_ACA_ERROR_MESSAGE:
+            snippet = raw_body[:_MAX_ERROR_BODY_CHARS]
+            if len(raw_body) > _MAX_ERROR_BODY_CHARS:
+                snippet += "… (truncated)"
+            message = f"{message}: {snippet}"
+        suggestion = None
+        if error.code or error.trace_id:
+            suggestion = f"ACA error code={error.code} traceId={error.trace_id}"
+        return ProviderError(
+            f"aca: {message}",
+            suggestion=suggestion,
+            status_code=status_code,
+            provider_name="aca",
+        )
+
+    def _agent_output_from_result(self, data: dict[str, Any], *, interrupted: bool) -> AgentOutput:
+        result = AcaResultData.model_validate(data)
+        input_tokens = result.input_tokens
+        output_tokens = result.output_tokens
+        tokens_used = (
+            (input_tokens or 0) + (output_tokens or 0)
+            if input_tokens is not None or output_tokens is not None
+            else None
+        )
+        return AgentOutput(
+            content=result.content,
+            raw_response=data,
+            tokens_used=tokens_used,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=result.cache_read_tokens,
+            cache_write_tokens=result.cache_write_tokens,
+            model=result.model,
+            partial=result.partial or interrupted,
+            session_seconds=result.session_seconds,
+        )
+
+    # ------------------------------------------------------------------
+    # Streaming transport (E3-T5, Branch S)
+    # ------------------------------------------------------------------
+
+    def _stream_execute(
+        self, url: str, params: dict[str, str], headers: dict[str, str], json_body: dict[str, Any]
+    ):
+        """Open the streaming ``/execute`` request.
+
+        Isolated as its own method (rather than inlined into `execute`) so
+        tests can substitute a fully-controlled fake response for
+        deterministic interrupt-race testing without depending on real
+        transport/event-loop scheduling.
+        """
+        client = self._ensure_client()
+        return client.stream("POST", url, params=params, headers=headers, json=json_body)
+
+    async def _send_interrupt(self, identifier: str) -> None:
+        """POST a runner-defined interrupt signal for the in-flight session.
+
+        This is a **runner-image contract**, not an ACA management-plane
+        operation: per the container-path-forwarding proxy contract
+        (`<POOL_MANAGEMENT_ENDPOINT>/<path>?identifier=<id>` forwards to
+        `<TARGET_PORT>/<path>`), a top-level `/interrupt` path is proxied
+        straight to the runner's own `/interrupt` handler for the session
+        already routed by `identifier` — the same session currently
+        streaming the `/execute` response — so the runner can signal its
+        in-flight inner-provider call to stop (Branch S). Deliberately a
+        sibling of `/execute`, not nested under it (`/execute/interrupt`
+        would forward to a runner path that doesn't exist in this
+        contract).
+        """
+        token = await self._get_access_token()
+        client = self._ensure_client()
+        response = await client.post(
+            self._build_url("interrupt"),
+            params={"identifier": identifier, "api-version": self._api_version},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        )
+        if response.status_code >= 400:
+            raise await self._error_from_response(response)
+
+    async def _stop_session(self, identifier: str) -> None:
+        """Best-effort hard-abort fallback when the in-stream interrupt fails.
+
+        Uses ACA's real Session Management **Delete** data-plane operation
+        (`DELETE {endpoint}/session?identifier=<id>&api-version=<v>` —
+        Microsoft Learn, Container Apps data-plane REST API), *not* the
+        fictional `POST {endpoint}/stopSession` this used to call. Note that
+        operation is documented as **"not supported for custom container
+        session pools"** (which is what this provider always targets), so
+        this call is expected to itself return an error for the MVP runner
+        image — it is issued anyway, best-effort, in case that restriction
+        is lifted for a future pool SKU, and its result never blocks the
+        actual local abort: the caller always cancels its own read loop
+        regardless of whether this call succeeds.
+        """
+        token = await self._get_access_token()
+        client = self._ensure_client()
+        response = await client.delete(
+            self._build_url("session"),
+            params={"identifier": identifier, "api-version": self._api_version},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        )
+        if response.status_code >= 400:
+            raise await self._error_from_response(response)
+
+    async def _read_frames(
+        self,
+        response: Any,
+        interrupt_signal: asyncio.Event | None,
+        identifier: str,
+        event_callback: EventCallback | None,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Consume the NDJSON stream, relaying frames and racing `interrupt_signal`.
+
+        Only one line-read (``__anext__``) is ever in flight at a time.
+        While not yet interrupted, each pending line read races against
+        `interrupt_signal.wait()`; once interrupted, subsequent lines are
+        awaited directly (E3-T6: fire the in-stream interrupt once, then
+        drain toward the runner's resulting partial `result` frame).
+
+        Returns ``(result_frame_data, interrupted)``. `result_frame_data` is
+        ``None`` when the stream ended without a terminal frame (either a
+        genuine premature close, or a hard local abort after the in-stream
+        interrupt itself failed to send — see `_stop_session`).
+        """
+        interrupted = False
+        result_data: dict[str, Any] | None = None
+        line_iter = response.aiter_lines()
+        next_line_task: asyncio.Task[Any] | None = None
+        try:
+            while True:
+                if next_line_task is None:
+                    next_line_task = asyncio.create_task(line_iter.__anext__())
+
+                if interrupt_signal is not None and not interrupted:
+                    interrupt_task = asyncio.create_task(interrupt_signal.wait())
+                    done, _pending = await asyncio.wait(
+                        {next_line_task, interrupt_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if interrupt_task in done:
+                        interrupt_signal.clear()
+                        interrupted = True
+                        try:
+                            await self._send_interrupt(identifier)
+                        except Exception:
+                            logger.warning(
+                                "aca: in-stream interrupt failed for identifier=%s; "
+                                "hard-aborting locally (best-effort session delete)",
+                                identifier,
+                            )
+                            with contextlib.suppress(Exception):
+                                await self._stop_session(identifier)
+                            next_line_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await next_line_task
+                            next_line_task = None
+                            return None, True
+                    else:
+                        interrupt_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await interrupt_task
+
+                try:
+                    if not next_line_task.done():
+                        await next_line_task
+                    line = next_line_task.result()
+                except StopAsyncIteration:
+                    break
+                finally:
+                    next_line_task = None
+
+                line = line.strip()
+                if not line:
+                    continue
+                frame = json.loads(line)
+                frame_type = frame.get("type")
+                data = frame.get("data") or {}
+                if frame_type == "result":
+                    result_data = data
+                    break
+                if frame_type == "error":
+                    raise self._error_from_frame(data)
+                if event_callback is not None:
+                    with contextlib.suppress(Exception):
+                        event_callback(frame_type, data)
+        finally:
+            if next_line_task is not None and not next_line_task.done():
+                next_line_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await next_line_task
+        return result_data, interrupted
+
+    async def execute(
+        self,
+        agent: AgentDef,
+        context: dict[str, Any],
+        rendered_prompt: str,
+        tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
+    ) -> AgentOutput:
+        """Delegate execution to the in-sandbox runner over Branch S streaming.
+
+        See module docstring / Data Flow. Raises `ProviderError` on any
+        transport failure, non-2xx response, or runner-reported `error`
+        frame; returns a partial `AgentOutput` when `interrupt_signal` fires
+        and the runner's resulting `result` frame (if any) arrives before
+        the stream otherwise ends.
+        """
+        logical_id = self.identifier_for(agent, context)
+        # Reserve the wire identifier for the full lifetime of this request
+        # (acquired before the request starts, released once it finishes —
+        # success, error, or interrupt) so a genuinely concurrent sibling
+        # sharing `logical_id` diverges while this call is in flight, and
+        # reuses `logical_id` once it is free again (OQ#1; see
+        # `identifier_for` / `_acquire_wire_identifier`). `slot` identifies
+        # exactly which reservation this call holds, so release always frees
+        # the right one even if calls sharing `logical_id` complete out of
+        # order.
+        identifier, slot = self._acquire_wire_identifier(logical_id)
+        try:
+            request = self._build_request(agent, context, rendered_prompt, tools)
+            token = await self._get_access_token()
+            url = self._build_url("execute")
+            params = {"identifier": identifier, "api-version": self._api_version}
+            headers = {"Authorization": f"Bearer {token}"}
+            body = self._wire_body(request)
+
+            try:
+                async with self._stream_execute(url, params, headers, body) as response:
+                    if response.status_code >= 400:
+                        raise await self._error_from_response(response)
+                    result_data, interrupted = await self._read_frames(
+                        response, interrupt_signal, identifier, event_callback
+                    )
+            except httpx.HTTPError as exc:
+                raise ProviderError(
+                    f"aca: transport error contacting runner at {url}: {exc}",
+                    provider_name="aca",
+                    is_retryable=True,
+                ) from exc
+
+            if result_data is None:
+                if interrupted:
+                    return AgentOutput(content={}, raw_response=None, partial=True)
+                raise ProviderError(
+                    "aca: runner stream ended without a terminal result frame",
+                    provider_name="aca",
+                    is_retryable=True,
+                )
+            return self._agent_output_from_result(result_data, interrupted=interrupted)
+        finally:
+            self._release_wire_identifier(logical_id, slot)
+
+    # ------------------------------------------------------------------
+    # Dialog turns (E4-T5, OQ#5)
+    # ------------------------------------------------------------------
+
+    async def execute_dialog_turn(
+        self,
+        system_prompt: str,
+        user_message: str,
+        history: list[dict[str, str]] | None = None,
+        model: str | None = None,
+    ) -> str:
+        """Disabled for v1 with a clear error (OQ#5 fallback decision).
+
+        The design's *Open Questions → Dialog turns* answer prefers routing
+        dialog turns through the same in-sandbox runner + gateway `execute()`
+        already uses, for the same isolation/credential boundary — but
+        explicitly permits disabling dialog turns under `aca` with a clear
+        error when the runner exposes no dialog endpoint in the MVP. Epic E4
+        did not build a runner dialog endpoint (see
+        `conductor.aca_runner.server`'s module docstring), so this overrides
+        the generic `AgentProvider.execute_dialog_turn` `NotImplementedError`
+        with a message that names the sandbox-boundary reason: silently
+        falling back to an on-host dialog call (the only alternative) would
+        run outside the sandbox this provider exists to enforce, leaking to
+        the host filesystem and bypassing the gateway.
+
+        Raises:
+            ProviderError: Always — dialog turns are unsupported under `aca`.
+        """
+        raise ProviderError(
+            "aca: dialog turns are not supported by the aca provider in this "
+            "release (the in-sandbox runner exposes no dialog endpoint); "
+            "running the turn on-host instead would bypass the sandbox "
+            "boundary this provider enforces.",
+            suggestion=(
+                "Avoid workflow features that issue dialog turns (human-gate "
+                "dialog refinement, dialog-based validators) on aca-backed "
+                "agents, or route the affected agent through a different "
+                "provider."
+            ),
+            provider_name="aca",
+            is_retryable=False,
+        )
+
+    # ------------------------------------------------------------------
+    # validate_connection() / close() (E3-T6, E3-T1)
+    # ------------------------------------------------------------------
+
+    async def validate_connection(self) -> bool:
+        """Lightweight management-plane + `/health` probe (skew check).
+
+        Acquires an AAD token (proves the *Session Executor* role is
+        reachable) then calls the pool's `/health` endpoint. Like every
+        other request forwarded through the container-path-forwarding proxy,
+        `/health` requires an `identifier` query parameter — ACA routes by
+        identifier, auto-allocating a session if none exists yet — so this
+        uses a dedicated, stable per-run health-check identifier
+        (`_health_identifier`) rather than omitting it. A
+        `conductor_version` mismatch between host and runner is logged as a
+        warning, never raised — version skew is a compatibility hint, not a
+        hard failure (mirrors the "safe degradation" convention of the other
+        best-effort provider hooks in `AgentProvider`).
+        """
+        try:
+            token = await self._get_access_token()
+        except Exception as exc:
+            raise ProviderError(
+                f"aca: failed to acquire a dynamicsessions.io access token: {exc}",
+                suggestion=(
+                    "Verify DefaultAzureCredential can authenticate (az login, "
+                    "managed identity, workload identity, etc.) and that the "
+                    "identity has the Session Executor role on the pool."
+                ),
+                provider_name="aca",
+                is_retryable=False,
+            ) from exc
+
+        client = self._ensure_client()
+        url = self._build_url("health")
+        try:
+            response = await client.get(
+                url,
+                params={
+                    "identifier": self._health_identifier,
+                    "api-version": self._api_version,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderError(
+                f"aca: failed to reach pool health endpoint at {url}: {exc}",
+                provider_name="aca",
+                is_retryable=True,
+            ) from exc
+        if response.status_code >= 400:
+            raise await self._error_from_response(response)
+
+        with contextlib.suppress(Exception):
+            self._warn_on_version_skew(response.json())
+        return True
+
+    def _warn_on_version_skew(self, health: dict[str, Any]) -> None:
+        runner_version = health.get("conductor_version") if isinstance(health, dict) else None
+        if not runner_version:
+            return
+        from conductor import __version__ as host_version
+
+        if runner_version != host_version:
+            logger.warning(
+                "aca: runner Conductor version %s differs from host version %s; "
+                "behavior may differ between host and sandbox.",
+                runner_version,
+                host_version,
+            )
+
+    async def close(self) -> None:
+        """Release the AAD credential and httpx client."""
+        if self._credential is not None:
+            with contextlib.suppress(Exception):
+                await self._credential.close()
+            self._credential = None
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None

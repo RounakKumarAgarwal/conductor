@@ -1,0 +1,434 @@
+"""Integration coverage for ``scripts/aca/provision-pool.sh`` (epic E5).
+
+The script drives the Azure CLI end-to-end and cannot be exercised against
+real Azure in CI/tests, so these tests run it against a scripted mock ``az``
+(``_mock_az.py``) that records every invocation's argv and returns just
+enough canned ``--query`` output to keep the script's control flow moving.
+Assertions inspect the recorded argv to verify the previously-unverified
+behaviors flagged in review:
+
+- ``TARGET_PORT`` propagation into ``az acr build --build-arg``.
+- ``--cooldown-period`` / ``--max-alive-period`` mutual exclusivity per
+  ``LIFECYCLE``.
+- The registry role-assignment grant uses ``--assignee-object-id`` /
+  ``--assignee-principal-type ServicePrincipal`` (not the graph-lookup-based
+  ``--assignee``, which races Entra ID replication for a just-created
+  identity).
+- ABAC-vs-legacy registry role selection (``Container Registry Repository
+  Reader`` vs ``AcrPull``).
+- The default ``IMAGE_TAG`` is unique across runs (not ``latest``) even when
+  the timestamp component is frozen (proving uniqueness comes from a
+  high-entropy nonce, not incidental timestamp/PID differences between
+  subprocess invocations), and an explicit override is honored.
+- The az CLI / ``containerapp`` extension preflight (``az upgrade --yes``,
+  ``az extension add --name containerapp --upgrade --allow-preview true
+  --yes``) runs before any session-pool-specific calls.
+- Invalid ``EGRESS``/``LIFECYCLE`` values are rejected *before* the preflight
+  or any other Azure CLI call is made (the mock ``az`` log stays empty).
+- An empty/unrecognized ACR ``roleAssignmentMode`` falls back to the legacy
+  ``AcrPull`` role.
+- The Session Executor role grant (on the pool, for a human/CI principal)
+  uses ``--assignee-object-id`` (not the graph-lookup-based ``--assignee``,
+  which a least-privileged CI identity may lack permission to resolve).
+  ``--assignee-object-id`` alone does not stop Azure CLI from separately
+  querying Microsoft Graph to infer the principal *type* — only
+  ``--assignee-principal-type`` does that. The default case (signed-in user)
+  passes ``--assignee-principal-type User`` since that type is known without
+  asking; an explicit ``$ASSIGNEE`` override honors an explicit
+  ``$ASSIGNEE_PRINCIPAL_TYPE`` the same way, and otherwise falls back to the
+  Graph lookup (documented, not silently assumed away).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = REPO_ROOT / "scripts" / "aca" / "provision-pool.sh"
+MOCK_AZ_SRC = Path(__file__).resolve().parent / "_mock_az.py"
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="provision-pool.sh is a bash script"
+)
+
+
+def _install_mock_az(bin_dir: Path) -> None:
+    """Copy the mock ``az`` shim into ``bin_dir`` and make it executable."""
+    az_path = bin_dir / "az"
+    shutil.copyfile(MOCK_AZ_SRC, az_path)
+    az_path.chmod(az_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _install_mock_date(bin_dir: Path, fixed_value: str) -> None:
+    """Install a ``date`` shim (ahead of the real one on ``PATH``) that always
+    prints ``fixed_value``, regardless of arguments.
+
+    Used only to freeze the timestamp component of the default ``IMAGE_TAG``
+    so a test can deterministically prove uniqueness comes from the
+    high-entropy nonce rather than from an incidental (non-deterministic)
+    timestamp/PID difference between two subprocess invocations.
+    """
+    date_path = bin_dir / "date"
+    date_path.write_text(f"#!/usr/bin/env bash\necho '{fixed_value}'\n")
+    date_path.chmod(date_path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def run_provision_script_raw(
+    tmp_path: Path,
+    extra_env: dict[str, str] | None = None,
+    freeze_date: str | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    """Run ``provision-pool.sh`` against the mock ``az`` without asserting success.
+
+    Returns the completed process (whatever its exit code) alongside the argv
+    log of every ``az`` invocation actually made, in call order. Used both by
+    ``run_provision_script`` (the happy-path helper) and by tests that expect
+    the script to fail validation before making any Azure CLI call.
+
+    ``freeze_date``, if given, installs a ``date`` shim that always prints
+    that fixed value (see ``_install_mock_date``).
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True)
+    _install_mock_az(bin_dir)
+    if freeze_date is not None:
+        _install_mock_date(bin_dir, freeze_date)
+
+    log_path = tmp_path / "az_calls.jsonl"
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["MOCK_AZ_LOG"] = str(log_path)
+    env.setdefault("RESOURCE_GROUP", "mock-rg")
+    env.setdefault("CONTAINERAPP_ENVIRONMENT", "mock-env")
+    env.setdefault("ACR_NAME", "mockacr")
+    if extra_env:
+        env.update(extra_env)
+
+    proc = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if not log_path.exists():
+        calls: list[list[str]] = []
+    else:
+        calls = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
+    return proc, calls
+
+
+def run_provision_script(
+    tmp_path: Path,
+    extra_env: dict[str, str] | None = None,
+    freeze_date: str | None = None,
+) -> list[list[str]]:
+    """Run ``provision-pool.sh`` against the mock ``az`` and return its argv log.
+
+    Returns a list of argv lists, one per ``az`` invocation, in call order.
+    Asserts the script exits successfully; use ``run_provision_script_raw``
+    directly for the failure paths (e.g. invalid ``EGRESS``/``LIFECYCLE``).
+    """
+    proc, calls = run_provision_script_raw(tmp_path, extra_env, freeze_date=freeze_date)
+    assert proc.returncode == 0, (
+        f"provision-pool.sh failed (exit {proc.returncode}):\n"
+        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
+    return calls
+
+
+def _find_calls(calls: list[list[str]], *prefix: str) -> list[list[str]]:
+    """Return every call whose leading args match ``prefix``."""
+    return [c for c in calls if c[: len(prefix)] == list(prefix)]
+
+
+def _flag_value(call: list[str], flag: str) -> str | None:
+    """Return the value following ``flag`` in ``call``, if present."""
+    if flag in call:
+        idx = call.index(flag)
+        if idx + 1 < len(call):
+            return call[idx + 1]
+    return None
+
+
+class TestTargetPortPropagation:
+    def test_target_port_forwarded_to_acr_build(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"TARGET_PORT": "9090"})
+
+        build_calls = _find_calls(calls, "acr", "build")
+        assert len(build_calls) == 1
+        assert f"TARGET_PORT=9090" in build_calls[0]  # noqa: F541 - explicit for clarity
+
+        pool_create_calls = _find_calls(calls, "containerapp", "sessionpool", "create")
+        assert len(pool_create_calls) == 1
+        assert _flag_value(pool_create_calls[0], "--target-port") == "9090"
+
+
+class TestLifecycleFlagExclusivity:
+    def test_timed_lifecycle_uses_cooldown_only(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"LIFECYCLE": "timed"})
+        pool_create = _find_calls(calls, "containerapp", "sessionpool", "create")[0]
+
+        assert _flag_value(pool_create, "--lifecycle-type") == "Timed"
+        assert "--cooldown-period" in pool_create
+        assert "--max-alive-period" not in pool_create
+
+    def test_on_container_exit_lifecycle_uses_max_alive_only(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"LIFECYCLE": "on_container_exit"})
+        pool_create = _find_calls(calls, "containerapp", "sessionpool", "create")[0]
+
+        assert _flag_value(pool_create, "--lifecycle-type") == "OnContainerExit"
+        assert "--max-alive-period" in pool_create
+        assert "--cooldown-period" not in pool_create
+
+    def test_invalid_lifecycle_rejected_before_any_az_call(self, tmp_path: Path) -> None:
+        proc, calls = run_provision_script_raw(tmp_path, {"LIFECYCLE": "bogus"})
+
+        assert proc.returncode != 0
+        # Validation must reject the bad value before the preflight (or any
+        # other) Azure CLI call is made — otherwise a bogus config still
+        # burns an `az upgrade`/`az extension add` round-trip before failing.
+        assert calls == []
+
+
+class TestEgressValidation:
+    def test_invalid_egress_rejected_before_any_az_call(self, tmp_path: Path) -> None:
+        proc, calls = run_provision_script_raw(tmp_path, {"EGRESS": "bogus"})
+
+        assert proc.returncode != 0
+        assert calls == []
+
+
+class TestRegistryRoleAssignment:
+    def test_uses_object_id_and_principal_type_not_assignee(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path)
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        # The first role assignment is the registry pull grant, the second
+        # is the Session Executor grant on the pool.
+        registry_role_call = role_calls[0]
+
+        assert _flag_value(registry_role_call, "--assignee-object-id") == (
+            "11111111-1111-1111-1111-111111111111"
+        )
+        assert _flag_value(registry_role_call, "--assignee-principal-type") == "ServicePrincipal"
+        # The graph-lookup-based flag must not be used for the just-created
+        # identity (Entra ID replication race).
+        assert "--assignee" not in registry_role_call
+
+    def test_legacy_registry_uses_acrpull_role(self, tmp_path: Path) -> None:
+        calls = run_provision_script(
+            tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": "LegacyRegistryPermissions"}
+        )
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "AcrPull"
+
+    def test_abac_registry_uses_repository_reader_role(self, tmp_path: Path) -> None:
+        calls = run_provision_script(
+            tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": "AbacRepositoryPermissions"}
+        )
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "Container Registry Repository Reader"
+
+    def test_unrecognized_role_assignment_mode_falls_back_to_acrpull(self, tmp_path: Path) -> None:
+        # An empty or unrecognized `roleAssignmentMode` (e.g. an older `az
+        # acr` API version that predates ABAC) must fall back to the legacy
+        # `AcrPull` role rather than erroring or silently granting nothing.
+        calls = run_provision_script(
+            tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": "SomeFutureUnknownMode"}
+        )
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "AcrPull"
+
+    def test_empty_role_assignment_mode_falls_back_to_acrpull(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"MOCK_ACR_ROLE_ASSIGNMENT_MODE": ""})
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert _flag_value(role_calls[0], "--role") == "AcrPull"
+
+
+class TestSessionExecutorRoleAssignment:
+    def test_uses_assignee_object_id_not_plain_assignee(self, tmp_path: Path) -> None:
+        # The plain `--assignee` form performs a Microsoft Graph lookup to
+        # resolve the value to a principal, which a least-privileged CI
+        # identity may not have permission to do. ASSIGNEE is documented as
+        # an object ID, so --assignee-object-id skips that lookup entirely.
+        # Without an explicit ASSIGNEE_PRINCIPAL_TYPE, Azure CLI still infers
+        # the principal type via a *separate* Graph lookup (documented
+        # best-effort fallback, not avoided here) — see
+        # test_explicit_assignee_principal_type_is_honored below for the
+        # Graph-free path.
+        calls = run_provision_script(tmp_path, {"ASSIGNEE": "33333333-3333-3333-3333-333333333333"})
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        assert len(role_calls) == 2
+        session_executor_call = role_calls[1]
+
+        assert _flag_value(session_executor_call, "--role") == (
+            "Azure ContainerApps Session Executor"
+        )
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
+            "33333333-3333-3333-3333-333333333333"
+        )
+        assert "--assignee" not in session_executor_call
+        assert "--assignee-principal-type" not in session_executor_call
+
+    def test_defaults_assignee_to_signed_in_user(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path)
+
+        signed_in_user_calls = _find_calls(calls, "ad", "signed-in-user", "show")
+        assert len(signed_in_user_calls) == 1
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        session_executor_call = role_calls[1]
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
+            "22222222-2222-2222-2222-222222222222"
+        )
+        # `az ad signed-in-user show` only resolves for a real interactive/
+        # user sign-in, so this principal's type is known to be User without
+        # a Graph lookup — passed explicitly to avoid one.
+        assert _flag_value(session_executor_call, "--assignee-principal-type") == "User"
+
+    def test_explicit_assignee_principal_type_is_honored(self, tmp_path: Path) -> None:
+        # A CI pipeline authenticating as a service principal can set
+        # ASSIGNEE_PRINCIPAL_TYPE explicitly to avoid the Graph lookup
+        # entirely, even though the default (unset) case falls back to it.
+        calls = run_provision_script(
+            tmp_path,
+            {
+                "ASSIGNEE": "44444444-4444-4444-4444-444444444444",
+                "ASSIGNEE_PRINCIPAL_TYPE": "ServicePrincipal",
+            },
+        )
+
+        role_calls = _find_calls(calls, "role", "assignment", "create")
+        session_executor_call = role_calls[1]
+        assert _flag_value(session_executor_call, "--assignee-object-id") == (
+            "44444444-4444-4444-4444-444444444444"
+        )
+        assert _flag_value(session_executor_call, "--assignee-principal-type") == (
+            "ServicePrincipal"
+        )
+
+
+class TestImageTag:
+    def test_default_tag_is_unique_across_runs(self, tmp_path: Path) -> None:
+        calls_a = run_provision_script(tmp_path / "a")
+        calls_b = run_provision_script(tmp_path / "b")
+
+        build_a = _find_calls(calls_a, "acr", "build")[0]
+        build_b = _find_calls(calls_b, "acr", "build")[0]
+        image_a = _flag_value(build_a, "--image")
+        image_b = _flag_value(build_b, "--image")
+
+        assert image_a is not None and ":latest" not in image_a
+        assert image_b is not None and ":latest" not in image_b
+        # The default tag must be collision-resistant (not just second-
+        # resolution wall-clock time), so two runs never collide even when
+        # they land in the same wall-clock second.
+        assert image_a != image_b
+
+    def test_default_tag_is_unique_with_frozen_timestamp(self, tmp_path: Path) -> None:
+        # A real subprocess-per-run test can't reliably force two invocations
+        # into the *same* wall-clock second (or the same PID) by chance, so a
+        # naive "run twice and compare" assertion could pass purely from
+        # incidental timestamp/PID differences without the fix actually
+        # working. Freeze `date` so both runs get the identical timestamp
+        # component deterministically, isolating the nonce as the only
+        # possible source of uniqueness.
+        #
+        # The frozen value is all-lowercase/digits to match the real format
+        # string the script now uses (`%Y%m%d%H%M%S`, no literal `T`/`Z`) —
+        # the tag must be lowercase or ACA can't resolve the pushed manifest,
+        # and the script rejects an uppercase tag outright.
+        fixed_timestamp = "20990101000000"
+        proc_a, calls_a = run_provision_script_raw(tmp_path / "a", freeze_date=fixed_timestamp)
+        proc_b, calls_b = run_provision_script_raw(tmp_path / "b", freeze_date=fixed_timestamp)
+        assert proc_a.returncode == 0, proc_a.stderr
+        assert proc_b.returncode == 0, proc_b.stderr
+
+        image_a = _flag_value(_find_calls(calls_a, "acr", "build")[0], "--image")
+        image_b = _flag_value(_find_calls(calls_b, "acr", "build")[0], "--image")
+        assert image_a is not None and image_b is not None
+
+        prefix = f"conductor-agent-runner:build-{fixed_timestamp}-"
+        assert image_a.startswith(prefix)
+        assert image_b.startswith(prefix)
+
+        nonce_a = image_a[len(prefix) :]
+        nonce_b = image_b[len(prefix) :]
+        # 128 bits of entropy hex-encoded is exactly 32 lowercase hex
+        # characters — well beyond the ~15 bits a bare `$RANDOM` (0-32767)
+        # suffix offered. Match the format exactly (not just a length floor)
+        # so a regression to, say, an uppercase or non-hex nonce is caught.
+        hex32 = re.compile(r"^[0-9a-f]{32}$")
+        assert hex32.match(nonce_a), f"nonce_a not a 32-char lowercase hex string: {nonce_a!r}"
+        assert hex32.match(nonce_b), f"nonce_b not a 32-char lowercase hex string: {nonce_b!r}"
+        assert nonce_a != nonce_b
+
+    def test_explicit_image_tag_is_honored(self, tmp_path: Path) -> None:
+        calls = run_provision_script(tmp_path, {"IMAGE_TAG": "v1.2.3"})
+        build_call = _find_calls(calls, "acr", "build")[0]
+        assert _flag_value(build_call, "--image") == "conductor-agent-runner:v1.2.3"
+
+    def test_default_tag_is_all_lowercase(self, tmp_path: Path) -> None:
+        """Regression: the ACA session-pool API lowercases the image reference
+        it is handed, while OCI/Docker tags are case-SENSITIVE. The previous
+        default (`date -u +%Y%m%dT%H%M%SZ`) therefore pushed `...T0000Z-...`
+        and had pool creation fail minutes later looking for `...t0000z-...`
+        (`ImageManifestNotFound`/`MANIFEST_UNKNOWN`) — on *every* run with
+        default settings."""
+        calls = run_provision_script(tmp_path)
+        image = _flag_value(_find_calls(calls, "acr", "build")[0], "--image")
+        assert image is not None
+        tag = image.split(":", 1)[1]
+        assert tag == tag.lower(), f"default IMAGE_TAG must be lowercase, got: {tag!r}"
+
+    def test_uppercase_image_tag_override_is_rejected_before_any_az_call(
+        self, tmp_path: Path
+    ) -> None:
+        """An uppercase override must fail fast, not after `az acr build` has
+        already spent minutes pushing an image the pool can never resolve."""
+        proc, calls = run_provision_script_raw(tmp_path, {"IMAGE_TAG": "Build-2099T01Z"})
+
+        assert proc.returncode != 0
+        assert "lowercase" in proc.stderr
+        assert calls == [], f"no az call should have run, got: {calls}"
+
+
+class TestPreflight:
+    def test_az_upgrade_and_extension_upgrade_run_before_sessionpool_calls(
+        self, tmp_path: Path
+    ) -> None:
+        calls = run_provision_script(tmp_path)
+
+        upgrade_calls = _find_calls(calls, "upgrade")
+        extension_calls = _find_calls(calls, "extension", "add")
+        assert len(upgrade_calls) == 1
+        assert len(extension_calls) == 1
+        assert "--yes" in upgrade_calls[0]
+        assert _flag_value(extension_calls[0], "--name") == "containerapp"
+        assert "--upgrade" in extension_calls[0]
+        # `--allow-preview true` and `--yes` are both required for a
+        # non-interactive install of the (at time of writing) preview
+        # `containerapp` extension — either missing would hang/fail in CI.
+        assert _flag_value(extension_calls[0], "--allow-preview") == "true"
+        assert "--yes" in extension_calls[0]
+
+        first_sessionpool_idx = next(
+            i for i, c in enumerate(calls) if c[:2] == ["containerapp", "sessionpool"]
+        )
+        upgrade_idx = calls.index(upgrade_calls[0])
+        extension_idx = calls.index(extension_calls[0])
+        assert upgrade_idx < first_sessionpool_idx
+        assert extension_idx < first_sessionpool_idx
