@@ -176,9 +176,22 @@ class TestToolsAllowlistCrossCheck:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
         config = _build_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
         )
         with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             validate_workflow_config(config)
+
+    def test_empty_tools_list_with_mcp_tools_but_no_servers_is_allowed(
+        self, patch_caps: Any
+    ) -> None:
+        """With no ``mcp_servers`` declared there is nothing to forward, so
+        ``tools: []`` genuinely disables every tool and must stay valid even
+        against an ``mcp_tools=True`` provider."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+        )
+        validate_workflow_config(config)  # no raise
 
     def test_non_empty_tools_list_against_no_passthrough_errors(self, patch_caps: Any) -> None:
         patch_caps({"copilot": _caps(workflow_tools_passthrough=False)})
@@ -265,6 +278,49 @@ class TestForEachInlineToolsCrossCheck:
                 )
             ],
         )
+
+    def _for_each_mcp_config(
+        self,
+        *,
+        inline: AgentDef,
+        mcp_servers: dict[str, MCPServerDef] | None = None,
+    ) -> WorkflowConfig:
+        # The entry agent OMITS ``tools:`` (and there is no workflow-level
+        # ``tools:``), so it cannot trip the check itself — isolating the
+        # assertion to the inline agent.
+        return _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            mcp_servers=mcp_servers,
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                )
+            ],
+        )
+
+    def test_inline_empty_tools_with_mcp_servers_errors(self, patch_caps: Any) -> None:
+        """Mirror of the top-level case: ``tools: []`` cannot be honored when
+        the provider attaches every declared MCP server regardless."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        config = self._for_each_mcp_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
+        )
+        with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
+            validate_workflow_config(config)
+
+    def test_inline_empty_tools_without_mcp_servers_passes(self, patch_caps: Any) -> None:
+        """Mirror of the top-level case: nothing to forward -> ``tools: []``
+        genuinely disables everything and stays valid."""
+        patch_caps({"copilot": _caps(workflow_tools_passthrough=False, mcp_tools=True)})
+        config = self._for_each_mcp_config(
+            inline=AgentDef(name="inner", prompt="{{ item }}", tools=[]),
+        )
+        validate_workflow_config(config)  # no raise
 
     def test_inline_omitted_tools_inherits_workflow_tools_errors(self, patch_caps: Any) -> None:
         """Inline agent omits ``tools:`` + non-empty workflow ``tools:`` -> error."""
@@ -1332,7 +1388,12 @@ class TestAcaRealCapabilitiesCrossCheck:
     it as the workflow default.
     """
 
-    def _aca_workflow(self, *, agents: list[AgentDef]) -> WorkflowConfig:
+    def _aca_workflow(
+        self,
+        *,
+        agents: list[AgentDef],
+        mcp_servers: dict[str, MCPServerDef] | None = None,
+    ) -> WorkflowConfig:
         from conductor.config.schema import ProviderSettings
 
         return WorkflowConfig(
@@ -1340,7 +1401,8 @@ class TestAcaRealCapabilitiesCrossCheck:
                 name="test",
                 entry_point=agents[0].name,
                 runtime=RuntimeConfig(
-                    provider=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com")
+                    provider=ProviderSettings(name="aca", pool_endpoint="https://pool.example.com"),
+                    mcp_servers=mcp_servers or {},
                 ),
             ),
             agents=agents,
@@ -1375,9 +1437,19 @@ class TestAcaRealCapabilitiesCrossCheck:
         patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
         config = self._aca_workflow(
             agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
         )
         with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
             validate_workflow_config(config)
+
+    def test_empty_tools_without_mcp_servers_passes_against_aca(self, patch_caps: Any) -> None:
+        """With no ``mcp_servers`` declared the runner has nothing to attach,
+        so ``tools: []`` genuinely disables every tool and must validate."""
+        from conductor.providers.aca import AcaRuntimeProvider
+
+        patch_caps({"aca": AcaRuntimeProvider.CAPABILITIES})
+        config = self._aca_workflow(agents=[AgentDef(name="a", prompt="hi", tools=[])])
+        validate_workflow_config(config)  # no raise
 
     def test_no_tools_against_real_aca_capabilities_passes(self, patch_caps: Any) -> None:
         """Positive control: omitting ``tools:`` (agent gets the provider's
@@ -1421,3 +1493,69 @@ class TestAcaRealCapabilitiesCrossCheck:
             ],
         )
         validate_workflow_config(config)  # no raise
+
+
+class TestClaudeAgentSdkRealCapabilitiesCrossCheck:
+    """#335 flipped ``mcp_tools`` to True for ``claude-agent-sdk``. Pin what
+    that means for the validator against the REAL descriptor, not a synthetic
+    one — mirrors ``TestAcaRealCapabilitiesCrossCheck``.
+    """
+
+    def _sdk_workflow(
+        self,
+        *,
+        agents: list[AgentDef],
+        mcp_servers: dict[str, MCPServerDef] | None = None,
+    ) -> WorkflowConfig:
+        from conductor.config.schema import ProviderSettings
+
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="test",
+                entry_point=agents[0].name,
+                runtime=RuntimeConfig(
+                    provider=ProviderSettings(name="claude-agent-sdk"),
+                    mcp_servers=mcp_servers or {},
+                ),
+            ),
+            agents=agents,
+        )
+
+    def _patch(self, patch_caps: Any) -> None:
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+
+        patch_caps({"claude-agent-sdk": ClaudeAgentSdkProvider.CAPABILITIES})
+
+    def test_mcp_servers_are_accepted(self, patch_caps: Any) -> None:
+        """The whole point of #335: declaring MCP servers no longer fails."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(
+            agents=[AgentDef(name="a", prompt="hi")],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
+        )
+        validate_workflow_config(config)  # no raise
+
+    def test_empty_tools_with_mcp_servers_is_rejected(self, patch_caps: Any) -> None:
+        """``tools: []`` disables only the built-in preset; declared MCP
+        servers still attach, so the combination cannot be honored."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(
+            agents=[AgentDef(name="a", prompt="hi", tools=[])],
+            mcp_servers={"docs": MCPServerDef(command="docs-server")},
+        )
+        with pytest.raises(ConfigurationError, match="there is no way to disable tools"):
+            validate_workflow_config(config)
+
+    def test_empty_tools_without_mcp_servers_is_allowed(self, patch_caps: Any) -> None:
+        """Nothing to attach -> ``tools: []`` genuinely disables everything.
+        Guards examples/experimental-claude-agent-sdk.yaml."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=[])])
+        validate_workflow_config(config)  # no raise
+
+    def test_non_empty_tools_is_still_rejected(self, patch_caps: Any) -> None:
+        """``workflow_tools_passthrough`` stays False — #335 did not change it."""
+        self._patch(patch_caps)
+        config = self._sdk_workflow(agents=[AgentDef(name="a", prompt="hi", tools=["search"])])
+        with pytest.raises(ConfigurationError, match="does not honor per-agent tool allowlists"):
+            validate_workflow_config(config)
