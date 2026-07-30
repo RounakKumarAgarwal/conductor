@@ -60,10 +60,11 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
     Raises:
         ValidationError: If the value or any nested value doesn't match.
     """
-    if not _check_type(value, field_def.type):
+    if not check_type(value, field_def.type):
         raise ValidationError(
             f"Output field '{field_name}' has wrong type: "
-            f"expected {field_def.type}, got {type(value).__name__}",
+            f"expected {field_def.type}, got {type(value).__name__} "
+            f"(received: {_describe_value(value)})",
             suggestion=f"Ensure agent returns correct type for '{field_name}'",
         )
 
@@ -72,16 +73,46 @@ def _validate_field(field_name: str, value: Any, field_def: OutputField) -> None
 
     if field_def.type == "array" and field_def.items and isinstance(value, list):
         for i, item in enumerate(value):
-            if not _check_type(item, field_def.items.type):
+            if not check_type(item, field_def.items.type):
                 raise ValidationError(
                     f"Array item {i} in '{field_name}' has wrong type: "
-                    f"expected {field_def.items.type}, got {type(item).__name__}",
+                    f"expected {field_def.items.type}, got {type(item).__name__} "
+                    f"(received: {_describe_value(item)})",
                     suggestion=f"Ensure all items in '{field_name}' have correct type",
                 )
             _validate_field(field_name, item, field_def.items)
 
 
-def _check_type(value: Any, expected: str) -> bool:
+def _describe_value(value: Any, max_chars: int = 200) -> str:
+    """Render a value for an error message, describing containers by shape.
+
+    Diagnosing a shape mismatch from logs alone is impractical when the
+    message names only the two types. ``validate_output`` also runs on ``set``
+    and ``script`` step output, so dict and list values are reduced to their
+    keys or length rather than dumped. Scalars are still rendered via ``repr``
+    and truncated, since a mismatched scalar is usually the whole diagnosis.
+
+    Args:
+        value: The value that failed validation.
+        max_chars: Maximum length of the rendered value before truncation.
+
+    Returns:
+        A short description suitable for an error message.
+    """
+    if isinstance(value, dict):
+        keys = sorted(str(k) for k in value)
+        rendered = f"object with keys {keys}"
+    elif isinstance(value, list):
+        return f"array of {len(value)} item(s)"
+    else:
+        rendered = repr(value)
+
+    if len(rendered) > max_chars:
+        return rendered[:max_chars] + "..."
+    return rendered
+
+
+def check_type(value: Any, expected: str) -> bool:
     """Check if value matches expected type.
 
     Args:

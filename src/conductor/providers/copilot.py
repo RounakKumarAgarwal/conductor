@@ -20,10 +20,14 @@ from typing import TYPE_CHECKING, Any, TypeGuard
 
 from conductor.config.schema import ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
+from conductor.executor.output import validate_output
 from conductor.providers._event_format import (
+    emit_parse_recovery_event,
     extract_tool_result_text,
     format_tool_arguments,
 )
+from conductor.providers._output_shape import normalize_agent_output
+from conductor.providers._recovery_prompt import build_parse_recovery_prompt
 from conductor.providers._schema import SchemaDepthError, build_prompt_schema_properties
 from conductor.providers.base import (
     AgentOutput,
@@ -1150,8 +1154,15 @@ class CopilotProvider(AgentProvider):
                     session_destroyed = True  # Prevent finally from destroying it
                     partial_content: dict[str, Any]
                     try:
-                        partial_content = self._extract_json(response_content)
+                        extracted = self._extract_json(response_content)
                     except (json.JSONDecodeError, ValueError):
+                        extracted = None
+                    # Partial output skips validation and has no recovery loop,
+                    # so a non-object here would reach the engine as a scalar
+                    # ``AgentOutput.content`` and fail downstream.
+                    if isinstance(extracted, dict):
+                        partial_content = extracted
+                    else:
                         partial_content = {"result": response_content}
                     partial_usage = SDKResponse(
                         content=response_content,
@@ -1185,11 +1196,13 @@ class CopilotProvider(AgentProvider):
 
                 # Try to parse the response as JSON with recovery loop
                 max_recovery = (retry_config or self._retry_config).max_parse_recovery_attempts
-                last_parse_error: str | None = None
+                last_failure: Exception | None = None
 
                 for recovery_attempt in range(max_recovery + 1):  # +1 for initial attempt
                     try:
                         parsed_content = self._extract_json(response_content)
+                        parsed_content = normalize_agent_output(parsed_content, output_schema)
+                        validate_output(parsed_content, output_schema)
                         final_usage = SDKResponse(
                             content=response_content,
                             input_tokens=total_input_tokens,
@@ -1199,27 +1212,30 @@ class CopilotProvider(AgentProvider):
                             resolved_model=current_resolved_model,
                         )
                         return parsed_content, final_usage
-                    except (json.JSONDecodeError, ValueError) as e:
-                        last_parse_error = str(e)
+                    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                        last_failure = e
+                        is_schema_failure = isinstance(e, ValidationError)
 
                         # If this was the last recovery attempt, break and raise
                         if recovery_attempt >= max_recovery:
                             break
 
-                        # Log recovery attempt in verbose mode
-                        if verbose_enabled:
-                            self._log_parse_recovery(
-                                recovery_attempt + 1,
-                                max_recovery,
-                                last_parse_error,
-                                agent_name=agent.name,
-                            )
+                        # Rendered by ConsoleEventSubscriber under --verbose,
+                        # so no separate console write here.
+                        emit_parse_recovery_event(
+                            event_callback,
+                            attempt=recovery_attempt + 1,
+                            max_attempts=max_recovery,
+                            is_schema_failure=is_schema_failure,
+                            error=str(e),
+                        )
 
                         # Build recovery prompt and send to same session
-                        recovery_prompt = self._build_parse_recovery_prompt(
-                            parse_error=last_parse_error,
+                        recovery_prompt = build_parse_recovery_prompt(
+                            parse_error=str(e),
                             original_response=response_content,
                             schema=schema_for_prompt,  # type: ignore[arg-type]
+                            is_schema_failure=is_schema_failure,
                         )
 
                         # Send recovery prompt and get new response
@@ -1245,10 +1261,23 @@ class CopilotProvider(AgentProvider):
                         if recovery_response.resolved_model:
                             current_resolved_model = recovery_response.resolved_model
 
-                # All recovery attempts exhausted
+                # All recovery attempts exhausted. A schema-shape failure keeps
+                # its own error: it names the offending field and type, which a
+                # generic parse error would discard.
                 expected_fields = list(output_schema.keys())
+                if isinstance(last_failure, ValidationError):
+                    logger.error(
+                        "Agent '%s': parse recovery exhausted after %d attempts "
+                        "(schema failure). Expected fields: %s. Response started with: %s",
+                        agent.name,
+                        max_recovery,
+                        expected_fields,
+                        response_content[:500],
+                    )
+                    raise last_failure
+
                 raise ProviderError(
-                    f"Failed to parse structured output from agent response: {last_parse_error}",
+                    f"Failed to parse structured output from agent response: {last_failure}",
                     suggestion=(
                         f"Agent was expected to return JSON with fields: {expected_fields}. "
                         f"Response started with: {response_content[:500]}... "
@@ -1266,8 +1295,11 @@ class CopilotProvider(AgentProvider):
         except ProviderError:
             raise
         except ValidationError:
-            # Configuration errors (e.g. unsupported reasoning_effort) are
-            # deterministic; surface unwrapped so retries don't mask them.
+            # Deterministic failures: a configuration error (e.g. unsupported
+            # reasoning_effort) or a schema-shape failure that already
+            # exhausted its recovery budget. Neither is fixed by re-running
+            # the agent, so surface unwrapped rather than letting the retry
+            # loop mask it.
             raise
         except Exception as e:
             raise ProviderError(
@@ -1569,39 +1601,6 @@ class CopilotProvider(AgentProvider):
         finally:
             await session.disconnect()
 
-    def _log_parse_recovery(
-        self,
-        attempt: int,
-        max_attempts: int,
-        error: str,
-        agent_name: str | None = None,
-    ) -> None:
-        """Log a parse recovery attempt in verbose mode.
-
-        Args:
-            attempt: Current recovery attempt number (1-based).
-            max_attempts: Maximum number of recovery attempts.
-            error: The parse error message.
-            agent_name: Optional agent identifier used to attribute the
-                recovery message to a specific concurrent agent.
-        """
-        from rich.console import Console
-        from rich.text import Text
-
-        console = Console(stderr=True, highlight=False)
-
-        text = Text()
-        text.append("    ├─ ", style="dim")
-        if agent_name:
-            text.append(f"[{agent_name}] ", style="magenta")
-        text.append("🔄 ", style="")
-        text.append(f"Parse Recovery {attempt}/{max_attempts}", style="yellow bold")
-        text.append(" - ", style="dim")
-        # Truncate error message for display
-        error_preview = error[:100] + "..." if len(error) > 100 else error
-        text.append(error_preview, style="dim italic")
-        console.print(text)
-
     def _extract_json(self, content: str) -> dict[str, Any]:
         """Extract JSON from response content.
 
@@ -1654,48 +1653,6 @@ class CopilotProvider(AgentProvider):
                 pass
 
         raise ValueError(f"Could not extract JSON from response: {content[:500]}...")
-
-    def _build_parse_recovery_prompt(
-        self,
-        parse_error: str,
-        original_response: str,
-        schema: dict[str, Any],
-    ) -> str:
-        """Build a prompt to recover from JSON parse failures.
-
-        When an agent's response cannot be parsed as valid JSON, this method
-        creates a follow-up prompt that provides the model with:
-        - The specific parse error encountered
-        - A truncated view of its original response
-        - The expected JSON schema
-
-        This allows the model to understand what went wrong and correct its
-        response format without starting a new conversation.
-
-        Args:
-            parse_error: The error message from the parse attempt.
-            original_response: The agent's malformed response.
-            schema: The expected output schema as a dict.
-
-        Returns:
-            A prompt asking the agent to correct its response format.
-        """
-        # Truncate the original response to avoid overwhelming the context
-        truncated_response = original_response[:500]
-        if len(original_response) > 500:
-            truncated_response += "..."
-
-        schema_desc = json.dumps(schema, indent=2)
-
-        return (
-            f"Your previous response could not be parsed as valid JSON.\n\n"
-            f"**Parse Error:** {parse_error}\n\n"
-            f"**Your response started with:**\n```\n{truncated_response}\n```\n\n"
-            f"**Expected JSON schema:**\n```json\n{schema_desc}\n```\n\n"
-            f"Please respond with ONLY a valid JSON object matching the schema above. "
-            f"Do NOT include markdown code blocks, explanatory text, or anything other "
-            f"than the raw JSON object."
-        )
 
     def _build_prompt_schema(
         self, schema: dict[str, OutputField], depth: int = 0

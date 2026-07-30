@@ -1089,6 +1089,20 @@ class ConsoleEventSubscriber:
                 style="yellow",
             )
 
+        elif t == "agent_parse_recovery":
+            agent_name = d.get("agent_name", "?")
+            attempt = d.get("attempt", "?")
+            max_attempts = d.get("max_attempts", "?")
+            reason = d.get("reason", "?")
+            error = d.get("error", "")
+            kind = "output schema mismatch" if reason == "schema" else "invalid JSON"
+            detail = f": {error}" if error else ""
+            verbose_log(
+                f"  WARNING: retrying '{agent_name}' output ({kind}) "
+                f"— attempt {attempt}/{max_attempts}{detail}",
+                style="yellow",
+            )
+
 
 def _validator_label(data: dict[str, Any]) -> str:
     """Build an agent label including a for-each ``item_key`` when present."""

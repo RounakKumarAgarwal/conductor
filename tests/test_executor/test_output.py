@@ -15,59 +15,59 @@ import pytest
 from conductor.config.schema import OutputField
 from conductor.exceptions import ValidationError
 from conductor.executor.output import (
-    _check_type,
+    check_type,
     parse_json_output,
     validate_output,
 )
 
 
 class TestCheckType:
-    """Tests for _check_type helper function."""
+    """Tests for check_type helper function."""
 
     def test_string_type(self) -> None:
         """Test string type checking."""
-        assert _check_type("hello", "string") is True
-        assert _check_type("", "string") is True
-        assert _check_type(123, "string") is False
-        assert _check_type(None, "string") is False
+        assert check_type("hello", "string") is True
+        assert check_type("", "string") is True
+        assert check_type(123, "string") is False
+        assert check_type(None, "string") is False
 
     def test_number_type(self) -> None:
         """Test number type checking."""
-        assert _check_type(42, "number") is True
-        assert _check_type(3.14, "number") is True
-        assert _check_type(0, "number") is True
-        assert _check_type(-1, "number") is True
-        assert _check_type("42", "number") is False
+        assert check_type(42, "number") is True
+        assert check_type(3.14, "number") is True
+        assert check_type(0, "number") is True
+        assert check_type(-1, "number") is True
+        assert check_type("42", "number") is False
         # Booleans should not count as numbers
-        assert _check_type(True, "number") is False
-        assert _check_type(False, "number") is False
+        assert check_type(True, "number") is False
+        assert check_type(False, "number") is False
 
     def test_boolean_type(self) -> None:
         """Test boolean type checking."""
-        assert _check_type(True, "boolean") is True
-        assert _check_type(False, "boolean") is True
-        assert _check_type(1, "boolean") is False
-        assert _check_type("true", "boolean") is False
+        assert check_type(True, "boolean") is True
+        assert check_type(False, "boolean") is True
+        assert check_type(1, "boolean") is False
+        assert check_type("true", "boolean") is False
 
     def test_array_type(self) -> None:
         """Test array type checking."""
-        assert _check_type([], "array") is True
-        assert _check_type([1, 2, 3], "array") is True
-        assert _check_type(["a", "b"], "array") is True
-        assert _check_type({}, "array") is False
-        assert _check_type("[]", "array") is False
+        assert check_type([], "array") is True
+        assert check_type([1, 2, 3], "array") is True
+        assert check_type(["a", "b"], "array") is True
+        assert check_type({}, "array") is False
+        assert check_type("[]", "array") is False
 
     def test_object_type(self) -> None:
         """Test object type checking."""
-        assert _check_type({}, "object") is True
-        assert _check_type({"key": "value"}, "object") is True
-        assert _check_type([], "object") is False
-        assert _check_type("{}", "object") is False
+        assert check_type({}, "object") is True
+        assert check_type({"key": "value"}, "object") is True
+        assert check_type([], "object") is False
+        assert check_type("{}", "object") is False
 
     def test_unknown_type(self) -> None:
         """Test unknown type accepts anything."""
-        assert _check_type("anything", "unknown_type") is True
-        assert _check_type(123, "unknown_type") is True
+        assert check_type("anything", "unknown_type") is True
+        assert check_type(123, "unknown_type") is True
 
 
 class TestValidateOutput:
@@ -342,8 +342,8 @@ class TestValidateOutputArrayRecursion:
         validate_source = inspect.getsource(validate_output)
         validate_field_source = inspect.getsource(_validate_field)
 
-        assert "_check_type(" not in validate_source
-        assert "_check_type(" in validate_field_source
+        assert "check_type(" not in validate_source
+        assert "check_type(" in validate_field_source
 
 
 class TestParseJsonOutput:
@@ -439,3 +439,49 @@ class TestParseJsonOutput:
         result = parse_json_output(raw)
 
         assert result == {"a": 1}
+
+
+class TestValidationErrorValueDescription:
+    """The error names the offending value, without echoing secrets.
+
+    `validate_output` also validates `set` and `script` step output, which may
+    carry credentials, so containers are described by shape rather than dumped.
+    """
+
+    def test_scalar_mismatch_shows_the_value(self) -> None:
+        schema = {"count": OutputField(type="number")}
+
+        with pytest.raises(ValidationError, match="received: 'many'"):
+            validate_output({"count": "many"}, schema)
+
+    def test_object_is_described_by_keys_not_contents(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+        secret = {"decision": {"decision": "APPROVE", "api_key": "sk-live-SECRET"}}
+
+        with pytest.raises(ValidationError) as exc_info:
+            validate_output(secret, schema)
+
+        message = str(exc_info.value)
+        assert "object with keys" in message
+        assert "api_key" in message
+        assert "sk-live-SECRET" not in message
+
+    def test_array_is_described_by_length(self) -> None:
+        schema = {"decision": OutputField(type="string")}
+
+        with pytest.raises(ValidationError, match=r"array of 3 item\(s\)"):
+            validate_output({"decision": ["a", "b", "c"]}, schema)
+
+    def test_long_scalar_is_truncated(self) -> None:
+        schema = {"count": OutputField(type="number")}
+
+        with pytest.raises(ValidationError) as exc_info:
+            validate_output({"count": "x" * 500}, schema)
+
+        assert "..." in str(exc_info.value)
+
+    def test_array_item_mismatch_also_describes_the_value(self) -> None:
+        schema = {"tags": OutputField(type="array", items=OutputField(type="string"))}
+
+        with pytest.raises(ValidationError, match="received: 42"):
+            validate_output({"tags": ["ok", 42]}, schema)
