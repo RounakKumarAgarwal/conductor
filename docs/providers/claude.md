@@ -1,10 +1,12 @@
 # Claude Provider Documentation
 
-The Claude provider enables Conductor workflows to use Anthropic's Claude models via the official Anthropic Python SDK.
+The Claude provider enables Conductor workflows to use Anthropic's Claude models via Pydantic AI (`pydantic-ai` package, `AnthropicModel`).
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Architecture & Internal Design](#architecture--internal-design)
+- [Behavioral & Migration Notes](#behavioral--migration-notes)
 - [API Key Setup](#api-key-setup)
 - [Model Selection](#model-selection)
 - [Runtime Configuration](#runtime-configuration)
@@ -58,6 +60,31 @@ agents:
 ```bash
 conductor run my-workflow.yaml --input question="What is Python?"
 ```
+
+## Architecture & Internal Design
+
+The Claude provider delegates its agentic loop, tool execution, and structured output processing to Pydantic AI (`pydantic-ai` package, `AnthropicModel`). `ClaudeProvider` in `src/conductor/providers/claude.py` implements the `AgentProvider` interface while delegating execution details to internal helpers in `src/conductor/providers/_pydantic_ai/`.
+
+### Package Structure (`src/conductor/providers/_pydantic_ai/`)
+
+- **`agent_builder.py`**: Factory (`build_agent`) mapping Conductor `AgentDef` configurations, system prompts, reasoning effort settings, temperature/max_tokens coercion, and output schemas to a Pydantic AI `Agent`.
+- **`converters.py`**: Recursively converts workflow `output` schemas into dynamic Pydantic models for Pydantic AI `ToolOutput`, enforcing scalar type checks and boolean rejection.
+- **`events.py`**: Bridges streaming Pydantic AI events (`PartStartEvent`, `PartDeltaEvent`, `FunctionToolCallEvent`, `FunctionToolResultEvent`) to Conductor `EventCallback` payloads (`agent_message`, `agent_reasoning`, `agent_tool_start`, `agent_tool_complete`, `agent_tool_output_truncated`), and emits turn boundary events.
+- **`interrupt.py`**: Drives agent execution via `Agent.iter()` while honoring Conductor's `interrupt_signal`, wall-clock `max_session_seconds`, and `UsageLimits`.
+- **`mcp_toolset.py`**: Wraps Conductor's `MCPManager` as a Pydantic AI `AbstractToolset`, managing tool naming, truncation, spill-to-file, and error signaling (`ToolFailed`).
+- **`retry.py`**: Provides Conductor-level retries (`execute_with_retry`) with exponential backoff, jitter, and Anthropic error classification. Pydantic AI tool retries are disabled, while output retries use `max_parse_recovery_attempts` for native structured-output correction.
+- **`structured_output.py`**: Handles post-processing (`extract_content`, `parse_text_fallback`), converting `ToolOutput` model dumps or fenced JSON text fallbacks into validated dicts via Conductor's `validate_output()`.
+- **`usage.py`**: Maps Pydantic AI `RunUsage` (token counts, cache reads and writes) to `AgentOutput` fields for tracking and pricing calculation by `UsageTracker`.
+
+## Behavioral & Migration Notes
+
+There are no user-facing breaking changes. Workflow YAML syntax, `runtime.provider: claude` configuration, provider contracts, and CLI commands remain completely unchanged.
+
+The transition to Pydantic AI includes the following internal behavioral changes:
+
+- **Native parse recovery**: The `retry.max_parse_recovery_attempts` YAML field controls Pydantic AI's output-validation retry budget. Each correction attempt emits `agent_parse_recovery`, matching the observable provider contract used by Copilot and Hermes.
+- **Truncation-hint path rewriting removed**: Legacy conductor-side path replacement in tool result text was removed. Tool output truncation and spill-to-file behavior are managed directly by `MCPManagerToolset`, and `agent_tool_output_truncated` events are emitted natively with original character length, truncated length, and spill path.
+- **Thinking signature preservation**: Thinking/reasoning block handling and signature preservation are delegated to Pydantic AI's native Anthropic model adapter.
 
 ## API Key Setup
 
@@ -244,59 +271,15 @@ agents:
 ## System Prompt
 
 When an agent defines a `system_prompt`, the Claude provider forwards this value as the native top-level `system` parameter in the Anthropic Messages API. 
-
 Key details of this integration:
-- **Consistent Application**: The `system_prompt` is sent on every API call in the agent's execution path, including the main loop, tool-use iterations, parse recovery, interrupt partial output requests, and retries.
+
+- **Consistent Application**: The `system_prompt` is sent on every API call in the agent's execution path, including the main loop, tool-use iterations, interrupt partial output requests, and retries.
 - **Empty Prompts**: Any empty or whitespace-only `system_prompt` is normalized to `None` and is not sent to the API.
 - **Caching**: Anthropic `cache_control` support for the `system` parameter is not implemented yet and is planned as a follow-up.
 
-## Streaming Limitations
+## Streaming
 
-**Phase 1 Implementation Status**: The Claude provider currently does NOT support real-time streaming.
-
-### Current Behavior
-
-- All responses are returned after completion (non-streaming)
-- The provider uses `client.messages.create()` instead of `client.messages.stream()`
-- You will not see partial responses during execution
-
-### Why?
-
-Real-time streaming requires:
-1. UI integration for displaying partial responses
-2. Event-driven architecture for handling streaming events
-3. Buffering and state management for partial content
-4. Error recovery during streaming
-
-These features are complex and deferred to Phase 2+ to keep Phase 1 focused on core functionality.
-
-### Workarounds
-
-If you need faster responses:
-
-1. **Reduce `max_tokens`**: Smaller responses complete faster
-   ```yaml
-   runtime:
-     max_tokens: 1024  # Faster than 8192
-   ```
-
-2. **Use Haiku models**: 3-5x faster than Sonnet/Opus
-   ```yaml
-   runtime:
-     default_model: claude-haiku-4.5
-   ```
-
-3. **Break workflows into smaller agents**: Multiple short responses instead of one long response
-
-### Phase 2+ Timeline
-
-Streaming support is planned for Phase 2 (estimated 2-3 weeks):
-- Real-time response streaming
-- Terminal UI for partial content display
-- Progress indicators and status updates
-- Streaming event handling and error recovery
-
-Track progress in the project roadmap or GitHub issues.
+The Claude provider streams model text, reasoning, tool lifecycle, and parse-recovery events incrementally through Pydantic AI. The dashboard, console, and JSONL event log receive updates while the agent is running rather than only after completion.
 
 ## Extended Thinking
 
