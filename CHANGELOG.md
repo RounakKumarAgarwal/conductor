@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   field — inheritance from the CLI subprocess covers it. A missing directory
   still fails before the provider is reached, and `strict_mcp_config` remains
   enabled so a `.mcp.json` sitting in the new directory cannot inject
-  undeclared servers. Note that the `claude` CLI also reads `CLAUDE.md` and
-  `.claude/settings*.json` from its working directory, so pointing an agent at
-  an untrusted checkout means running that checkout's instructions and hooks.
+  undeclared servers. The `claude` CLI would also read `CLAUDE.md` and
+  `.claude/settings*.json` from its working directory, but the same release
+  pins `setting_sources` to an empty list (see the skills entry below), so
+  those are no longer loaded from wherever the agent happens to run.
   Launch failures caused by a bad working directory are now reported as such
   rather than as connection problems, and are no longer treated as retryable.
   See
@@ -80,6 +81,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`skills: []` is now a real opt-out on `claude-agent-sdk`, and agents no
+  longer inherit ambient skills from the machine.** The provider left the SDK's
+  `setting_sources` unset, so the `claude` CLI discovered and enabled skills
+  from `~/.claude/skills/`, every `.claude/skills/` up the directory tree, and
+  enabled plugins — none of which the workflow declared, and all of which
+  varied by developer machine and launch directory. Conductor documents
+  `skills: []` as an explicit opt-out; on this provider it silently opted out
+  of nothing. Two options now carry that fix together and neither is redundant:
+  `setting_sources` is always `[]` (the same unconditional isolation
+  `strict_mcp_config` already applies to MCP servers), and `skills` is always
+  passed explicitly, because the SDK treats an omitted list as "CLI defaults
+  apply" and re-defaults `setting_sources` to `["user", "project"]` whenever
+  `skills` is set without it.
+  **Behavior change:** agents on this provider also stop picking up ambient
+  `CLAUDE.md`, `.claude/rules/*.md`, user/project/local `settings.json`
+  (including `env` and `apiKeyHelper`), and hooks. Instruction files can be
+  supplied explicitly with `--workspace-instructions` (or `--instructions`);
+  settings and hooks have no equivalent, so move anything load-bearing there
+  into the environment. Note the SDK's skill list is a context filter, not a
+  sandbox — undeclared skills are hidden from the model's listing, but their
+  files stay readable on disk.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
+
 - **`tools: []` no longer fails validation when no MCP servers are declared** —
   the capability cross-check rejected an explicit empty allowlist against any
   provider with `mcp_tools=True` and `workflow_tools_passthrough=False` (such
@@ -112,6 +136,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Copilot and Claude both respect. ([#343](https://github.com/microsoft/conductor/issues/343))
 
 ### Changed
+
+- **`claude-agent-sdk` now loads skills natively instead of injecting them into
+  every prompt.** The provider previously took the eager preamble path on the
+  grounds that the SDK had no skill surface — out of date, and expensive: the
+  full `SKILL.md` plus the entire `references/` tree was prepended to every
+  call, every retry, and every validator pass (~27K tokens for the bundled
+  `conductor` skill). The owning Claude Code plugin is now registered on the
+  session and the skill enabled by its `<plugin>:<skill>` name, so the CLI reads
+  only the frontmatter up front and loads the body on demand. An agent with an
+  explicit `tools: []` is granted back the single `Skill` tool when it has
+  skills enabled, since an empty base tool set would otherwise leave the
+  declared skill unreachable. Wheels now also ship
+  `plugins/conductor/.claude-plugin/`; without the manifest no plugin root
+  resolves at all, so a non-editable install would fail every skills-enabled
+  agent on this provider.
+  ([#352](https://github.com/microsoft/conductor/issues/352))
 
 - The `claude-agent-sdk` optional dependency floor is now
   `claude-agent-sdk>=0.2.82` — the 0.2.x line is what Conductor tests against.

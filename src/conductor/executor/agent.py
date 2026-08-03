@@ -292,9 +292,10 @@ class AgentExecutor:
             _verbose_log(f"  Tools: {resolved_tools}")
 
         # Resolve skill directories for providers with native skill support
-        # (Copilot passes these on session_kwargs; Claude has already had
-        # the skill content eager-injected into rendered_prompt above and
-        # ignores this).
+        # (Copilot passes these on session_kwargs, claude-agent-sdk maps them
+        # to plugin + skill-name options; providers without native support
+        # have already had the skill content eager-injected into
+        # rendered_prompt above and ignore this).
         skill_dirs: list[str] | None = None
         if getattr(self.provider, "supports_native_skills", False):
             skill_names = self._resolve_skills_for_agent(agent)
@@ -302,6 +303,7 @@ class AgentExecutor:
                 from conductor.skills import resolve_skill_directories
 
                 skill_dirs = [str(p) for p in resolve_skill_directories(skill_names)]
+                _verbose_log(f"  Skills: {skill_names}")
 
         # Execute via provider
         output = await self.provider.execute(
