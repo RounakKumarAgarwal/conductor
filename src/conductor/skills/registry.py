@@ -1,10 +1,9 @@
 """Built-in skill registry for Conductor.
 
-Phase 1 ships a single built-in skill — ``conductor`` — that points at
-the existing ``plugins/conductor/skills/conductor/`` directory inside the
-wheel. The skill directory follows the Copilot/Claude-Code skill format:
-``SKILL.md`` plus an optional ``references/`` subdirectory of supporting
-docs.
+Conductor ships one built-in skill — ``conductor`` — pointing at the
+``plugins/conductor/skills/conductor/`` directory inside the wheel. The skill
+directory follows the Copilot/Claude-Code skill format: ``SKILL.md`` plus an
+optional ``references/`` subdirectory of supporting docs.
 
 The plugins directory is bundled as wheel package data via the
 ``[tool.hatch.build.targets.wheel.force-include]`` entries in
@@ -12,23 +11,36 @@ The plugins directory is bundled as wheel package data via the
 installed wheels work; it falls back to a source-checkout location for
 editable installs and tests.
 
-Follow-up issues will add user-defined skill directories with a trust /
-allowlist model; for now the registry only accepts built-in skill names.
+Entries written in ``skills:`` are resolved here: a bare name must be a
+registered built-in, while anything path-shaped is resolved against the
+workflow file's directory. Discovering skills already installed in the
+user's environment (``~/.copilot/skills``, ``.github/skills``, plugin
+roots) is deliberately out of scope — discovery locations differ per
+provider, so it is tracked separately in issue #362.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from conductor.skills.errors import SkillError
+
 logger = logging.getLogger(__name__)
 
+# Sink for non-fatal diagnostics raised during resolution. Callers decide
+# where these land, because the right destination differs: warnings from
+# ``conductor validate`` are printed, warnings at run time are verbose-only.
+WarningSink = Callable[[str], None]
 
-class SkillNotFoundError(ValueError):
+
+class SkillNotFoundError(SkillError):
     """Raised when a skill name is not found in the registry."""
 
 
@@ -65,7 +77,7 @@ def _repo_or_wheel_root() -> Path:
       repository root, three directories above this file
       (``src/conductor/skills/registry.py``).
     * **Wheel install** — ``plugins/`` is bundled as package data via
-      hatchling's ``artifacts`` entry and lands alongside the
+      hatchling's ``force-include`` entries and lands alongside the
       ``conductor/`` package directory inside ``site-packages``.
 
     We probe both. The first hit wins.
@@ -77,7 +89,7 @@ def _repo_or_wheel_root() -> Path:
     if (repo_root / "plugins" / "conductor" / "skills").is_dir():
         return repo_root
 
-    # Wheel install: artifacts land alongside the package itself
+    # Wheel install: force-included files land alongside the package itself
     # (site-packages/plugins next to site-packages/conductor).
     wheel_root = here.parents[2]
     if (wheel_root / "plugins" / "conductor" / "skills").is_dir():
@@ -94,7 +106,10 @@ def list_builtin_skills() -> list[str]:
 
 
 def get_skill_directory(skill: str) -> Path:
-    """Resolve a built-in skill name to its on-disk directory.
+    """Resolve a built-in skill *name* to its on-disk directory.
+
+    Only handles registered built-in names. Path entries are handled by
+    :func:`resolve_skills`.
 
     Args:
         skill: The skill name as it appears in ``skills: [...]`` (e.g.
@@ -112,7 +127,9 @@ def get_skill_directory(skill: str) -> Path:
         available = ", ".join(list_builtin_skills()) or "(none)"
         raise SkillNotFoundError(
             f"Unknown skill {skill!r}. Available built-in skills: {available}. "
-            "User-defined skill directories are not yet supported."
+            "To use a skill of your own, give a path instead (e.g. "
+            "'./team-skills/my-skill'); an entry counts as a path when it "
+            "starts with '.' or '~', or contains a path separator."
         )
     path = (_repo_or_wheel_root() / rel).resolve()
     if not path.is_dir():
@@ -125,27 +142,231 @@ def get_skill_directory(skill: str) -> Path:
     return path
 
 
-def resolve_skill_directories(skills: list[str]) -> list[Path]:
-    """Resolve a list of skill names to their on-disk directories.
+@dataclass(frozen=True)
+class ResolvedSkill:
+    """A single skill resolved from one ``skills:`` entry."""
+
+    name: str
+    """Skill name — always the directory's basename.
+
+    Deliberately *not* the ``SKILL.md`` frontmatter name: the built-in
+    registry keys, the eager-injection ``<skill name="...">`` tag, and
+    claude-agent-sdk's ``<plugin>:<skill>`` qualified name are all
+    basename-derived. :func:`resolve_skill_plugin` enforces that the
+    frontmatter agrees for the provider that needs it.
+    """
+
+    directory: Path
+    """Absolute path to the directory holding ``SKILL.md``."""
+
+    source: str
+    """The ``skills:`` entry this was resolved from, verbatim.
+
+    A ``skills/`` root expands to several :class:`ResolvedSkill` objects
+    that share one ``source``, so error messages can name what the user
+    actually wrote.
+    """
+
+    def __post_init__(self) -> None:
+        """Assert the two invariants the docstrings above claim.
+
+        Both are established by :func:`resolve_skills` today, but this is
+        an exported public constructor and ``name`` is interpolated
+        unescaped into ``<skill name="...">`` by the loader. Same
+        reasoning as :class:`SkillPlugin`, which checks its own names for
+        the same reason.
+
+        Deliberately no ``is_dir()`` probe: filesystem state in a
+        constructor is a TOCTOU illusion, and establishing it is
+        correctly the producer's job.
+
+        Raises:
+            SkillNotFoundError: If ``name`` is not ``directory``'s
+                basename, or ``directory`` is not absolute.
+        """
+        if self.name != self.directory.name:
+            raise SkillNotFoundError(
+                f"ResolvedSkill.name {self.name!r} must equal its directory "
+                f"basename {self.directory.name!r}"
+            )
+        if not self.directory.is_absolute():
+            raise SkillNotFoundError(
+                f"ResolvedSkill.directory must be absolute, got {self.directory}"
+            )
+
+
+def is_path_entry(entry: str) -> bool:
+    """Whether a ``skills:`` entry denotes a filesystem path.
+
+    The test is purely syntactic — no disk access — so classification
+    never depends on what happens to exist locally, and a bare name like
+    ``conductor`` can never be shadowed by a same-named directory.
+
+    No ``os.path.isabs`` check is needed: every absolute form on either
+    POSIX or Windows (``/x``, ``C:\\x``, ``C:/x``, ``\\\\server\\share``)
+    already contains a separator.
+    """
+    return entry.startswith(("~", ".")) or "/" in entry or "\\" in entry
+
+
+def _resolve_path_entry(
+    entry: str, base_dir: Path | None, on_warning: WarningSink | None = None
+) -> list[Path]:
+    """Expand a path entry to the skill directories it denotes.
+
+    Accepts either granularity: a single skill directory (one holding
+    ``SKILL.md``) or a root containing several such directories.
 
     Args:
-        skills: List of built-in skill names.
+        entry: The raw path as written in ``skills:``.
+        base_dir: Directory a relative entry resolves against. Falls back
+            to the process working directory.
+        on_warning: Optional sink for non-fatal diagnostics — currently a
+            skills root that skipped subdirectories lacking a ``SKILL.md``.
 
     Returns:
-        List of absolute paths in the same order, with duplicates removed
-        (preserving first occurrence).
+        The entry itself for a single skill directory, or every child
+        holding a ``SKILL.md`` (sorted by name) for a root.
 
     Raises:
-        SkillNotFoundError: If any skill name is unknown.
+        SkillNotFoundError: If the path does not exist, is not a
+            directory, cannot be read, or is a directory holding neither
+            a ``SKILL.md`` nor any child that does.
     """
-    seen: set[Path] = set()
-    out: list[Path] = []
-    for name in skills:
-        path = get_skill_directory(name)
-        if path in seen:
-            continue
-        seen.add(path)
-        out.append(path)
+    path = Path(entry).expanduser()
+    if not path.is_absolute():
+        path = (base_dir if base_dir is not None else Path.cwd()) / path
+    # normpath, not resolve(): symlink aliases stay distinct, matching
+    # WorkflowEngine._resolve_agent_working_dir.
+    resolved = Path(os.path.normpath(path))
+
+    try:
+        if not resolved.exists():
+            raise SkillNotFoundError(
+                f"Skill path {entry!r} resolved to {resolved!s}, which does not exist. "
+                "Relative skill paths resolve against the workflow file's directory."
+            )
+        if not resolved.is_dir():
+            raise SkillNotFoundError(
+                f"Skill path {entry!r} resolved to {resolved!s}, which is not a "
+                "directory. Point it at a skill directory (one containing SKILL.md) "
+                "or at a directory of them."
+            )
+        if (resolved / "SKILL.md").is_file():
+            return [resolved]
+        entries = list(resolved.iterdir())
+        children = sorted(
+            (child for child in entries if (child / "SKILL.md").is_file()),
+            key=lambda child: child.name,
+        )
+        # Subdirectories that look like skills but have no SKILL.md. Files
+        # (a README, a LICENSE) are not reported — only a directory can
+        # plausibly have been *meant* as a skill. Without this, pointing at
+        # a root turns the loud "no SKILL.md" error you would get from
+        # naming the directory directly into silence: a mis-cased
+        # ``Skill.md`` or a file someone forgot to commit simply yields one
+        # fewer skill.
+        skipped = sorted(
+            child.name for child in entries if child.is_dir() and not (child / "SKILL.md").is_file()
+        )
+    except OSError as exc:
+        # A path Conductor can name but not inspect — an unreadable directory,
+        # or one whose parent is unreadable. Python re-raises EACCES from
+        # ``exists``, ``is_dir``, ``is_file`` and ``iterdir`` alike, so without
+        # this the caller sees a bare PermissionError traceback instead of a
+        # message naming the entry.
+        raise SkillNotFoundError(
+            f"Skill path {entry!r} resolved to {resolved!s}, which could not be read: {exc}"
+        ) from exc
+
+    if children:
+        if skipped and on_warning is not None:
+            on_warning(
+                f"Skills root {entry!r} expanded to {len(children)} skill(s) but "
+                f"skipped {len(skipped)} subdirector{'y' if len(skipped) == 1 else 'ies'} "
+                f"with no SKILL.md: {skipped!r}. Add a SKILL.md to each, or remove them."
+            )
+        return children
+
+    raise SkillNotFoundError(
+        f"Skill path {entry!r} resolved to {resolved!s}, which contains neither a "
+        "SKILL.md nor any subdirectory containing one. A skill directory holds "
+        "SKILL.md directly; a skills root holds one subdirectory per skill."
+    )
+
+
+def resolve_skills(
+    skills: Sequence[str],
+    base_dir: Path | None = None,
+    on_warning: WarningSink | None = None,
+) -> list[ResolvedSkill]:
+    """Resolve ``skills:`` entries to named, on-disk skill directories.
+
+    Each entry is either a **registered built-in name** (``conductor``)
+    or a **filesystem path**. Classification is syntactic — see
+    :func:`is_path_entry` — so a bare name is never shadowed by a
+    same-named local directory.
+
+    Every resolved directory's ``SKILL.md`` frontmatter is parsed and
+    checked here rather than only at ``conductor validate`` time,
+    because ``conductor run`` does not run the static validator and both
+    downstream CLIs skip an unparseable skill in silence.
+
+    Args:
+        skills: The entries as written in ``skills:``.
+        base_dir: Directory relative path entries resolve against
+            (normally the workflow file's directory). Falls back to the
+            process working directory.
+        on_warning: Optional sink for non-fatal diagnostics. ``conductor
+            validate`` routes these into its warning list; the executor
+            routes them to verbose logging.
+
+    Returns:
+        One :class:`ResolvedSkill` per skill directory, in entry order,
+        with duplicate directories removed (first occurrence wins).
+
+    Raises:
+        SkillNotFoundError: If an entry is an unknown built-in name, a
+            path that does not resolve to any skill directory, or two
+            different directories that would claim the same skill name.
+        SkillManifestError: If a resolved skill's ``SKILL.md`` is
+            missing, unparseable, or omits ``name`` / ``description``.
+    """
+    from conductor.skills.frontmatter import read_skill_frontmatter
+
+    # A skill's name is its directory basename, so this doubles as the
+    # seen-directories index: one name maps to exactly one directory.
+    by_name: dict[str, ResolvedSkill] = {}
+    out: list[ResolvedSkill] = []
+    for entry in skills:
+        if is_path_entry(entry):
+            directories = _resolve_path_entry(entry, base_dir, on_warning)
+        else:
+            directories = [get_skill_directory(entry)]
+        for directory in directories:
+            name = directory.name
+            seen = by_name.get(name)
+            if seen is not None:
+                if seen.directory == directory:
+                    # The same directory reached twice — a name and its
+                    # equivalent path, or two overlapping roots. First wins.
+                    continue
+                # Two different directories, one name. Every downstream
+                # consumer is name-keyed — the eager preamble emits
+                # ``<skill name="...">`` per skill and the native CLIs
+                # resolve by name — so one of the two would be shadowed
+                # with no indication which. Refusing is the same call
+                # ``resolve_skill_plugin`` makes for a qualified-name clash.
+                raise SkillNotFoundError(
+                    f"Skills {seen.source!r} and {entry!r} both resolve to a skill "
+                    f"named {name!r} ({seen.directory} and {directory}). Skill names "
+                    "must be unique — one would silently shadow the other. Rename one "
+                    "of the directories, or enable only one of them."
+                )
+            read_skill_frontmatter(directory)
+            resolved = ResolvedSkill(name=name, directory=directory, source=entry)
+            by_name[name] = resolved
+            out.append(resolved)
     return out
 
 
@@ -270,6 +491,12 @@ def _read_plugin_name(manifest: Path) -> str:
 def _declared_skill_name(skill_dir: Path) -> str:
     """Read the ``name`` a skill's ``SKILL.md`` frontmatter declares.
 
+    Delegates to :func:`~conductor.skills.frontmatter.read_skill_frontmatter`
+    so a broken manifest is reported the same way here as at
+    ``conductor validate`` time, and re-raises as
+    :class:`SkillPluginError` because that is the class
+    :func:`resolve_skill_plugin`'s callers catch.
+
     Args:
         skill_dir: Directory expected to contain ``SKILL.md``.
 
@@ -277,27 +504,15 @@ def _declared_skill_name(skill_dir: Path) -> str:
         The declared skill name.
 
     Raises:
-        SkillPluginError: If ``SKILL.md`` is missing, unreadable, or
-            declares no ``name`` in its frontmatter.
+        SkillPluginError: If ``SKILL.md`` is missing, unreadable, has
+            unparseable frontmatter, or omits ``name`` / ``description``.
     """
-    skill_md = skill_dir / "SKILL.md"
-    if not skill_md.is_file():
-        raise SkillPluginError(
-            f"Skill directory {skill_dir} has no SKILL.md, so the claude CLI will "
-            "not expose it under any name."
-        )
+    from conductor.skills.frontmatter import SkillManifestError, read_skill_frontmatter
+
     try:
-        text = skill_md.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise SkillPluginError(f"Skill manifest at {skill_md} could not be read: {exc}") from exc
-    match = re.search(r"\A---\r?\n(.*?)\r?\n---", text, re.DOTALL)
-    name = re.search(r"^name:\s*(\S+)\s*$", match.group(1), re.MULTILINE) if match else None
-    if name is None:
-        raise SkillPluginError(
-            f"Skill manifest at {skill_md} declares no 'name' in its YAML frontmatter. "
-            "The claude CLI resolves enabled skills by that name."
-        )
-    return name.group(1)
+        return read_skill_frontmatter(skill_dir).name
+    except SkillManifestError as exc:
+        raise SkillPluginError(str(exc)) from exc
 
 
 def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:

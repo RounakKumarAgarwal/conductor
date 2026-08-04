@@ -15,11 +15,25 @@ import jinja2
 from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
-from conductor.providers.capabilities import ProviderCapabilities, get_capabilities
+from conductor.providers.capabilities import (
+    ProviderCapabilities,
+    get_capabilities,
+    uses_native_skills,
+)
+from conductor.skills import (
+    BYTES_PER_TOKEN_ESTIMATE,
+    SkillError,
+    SkillPluginError,
+    is_path_entry,
+    load_skill_content,
+    resolve_skill_plugin,
+    resolve_skills,
+)
 from conductor.templating import is_jinja_template
 
 if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.skills import ResolvedSkill
 
 
 # Shared Jinja2 environment used purely for AST parsing of template strings.
@@ -256,7 +270,7 @@ def validate_workflow_config(
     # Cross-check workflow features against each provider's declared
     # ProviderCapabilities (issue #241). Surfaces silent capability
     # mismatches at validate time rather than at runtime.
-    cap_errors, cap_warnings = _validate_provider_capabilities(config)
+    cap_errors, cap_warnings = _validate_provider_capabilities(config, workflow_path)
     errors.extend(cap_errors)
     warnings.extend(cap_warnings)
 
@@ -1550,6 +1564,7 @@ def _resolved_provider_name(agent: AgentDef, default: str) -> str:
 
 def _validate_provider_capabilities(
     config: WorkflowConfig,
+    workflow_path: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     """Cross-check workflow features against each provider's declared capabilities.
 
@@ -1569,6 +1584,15 @@ def _validate_provider_capabilities(
 
     Capabilities are resolved lazily without instantiating providers so this
     runs cleanly in environments without API keys / network.
+
+    Args:
+        config: The workflow configuration to check.
+        workflow_path: Path of the workflow file, used as the base directory
+            for relative skill paths. When ``None``, checks needing the
+            filesystem are skipped with a warning rather than falling back to
+            ``Path.cwd()`` as ``_validate_subworkflow_refs`` does — resolving
+            a skill path against an arbitrary working directory would report
+            failures that say nothing about the workflow.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -1584,6 +1608,11 @@ def _validate_provider_capabilities(
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
     runtime_working_dir = config.workflow.runtime.working_dir
     runtime_skills = config.workflow.runtime.skills
+    skill_limits = config.workflow.runtime.skill_injection
+    skill_base_dir = workflow_path.resolve().parent if workflow_path is not None else None
+    # Keyed by the entry tuple, so agents sharing a skill list resolve once.
+    # A ``str`` value is a cached resolution failure.
+    skill_cache: dict[tuple[str, ...], list[ResolvedSkill] | str] = {}
 
     # Cache per provider name so we don't re-resolve for every agent.
     cache: dict[str, ProviderCapabilities] = {}
@@ -1655,6 +1684,134 @@ def _validate_provider_capabilities(
                 f"workflow-level 'tools:' so omitting 'tools:' grants the "
                 f"provider's default tool preset, or set this agent's "
                 f"'tools: []' to disable the built-in tools."
+            )
+
+    def _check_agent_skills(
+        agent: AgentDef, provider_name: str, caps: ProviderCapabilities
+    ) -> None:
+        """Resolve an agent's effective skills and check them against its provider.
+
+        Three failure classes, all of which otherwise leave the agent running
+        without the knowledge its author asked for:
+
+        * The entry does not resolve — unknown built-in name, missing path, or
+          a directory holding no ``SKILL.md``.
+        * The resolved ``SKILL.md`` has broken or incomplete frontmatter. Both
+          Copilot and Claude Code skip such a skill *silently*, so this is the
+          only place a user finds out.
+        * The provider cannot deliver it: ``claude-agent-sdk`` has no bare
+          skill-directory surface, so a skill outside a Claude Code plugin is
+          unreachable there even though Copilot loads it fine.
+
+        Eager-injection providers additionally get the ``runtime.skill_injection``
+        budget applied here, so an oversized preamble is reported before a run
+        starts rather than on first execution.
+        """
+        entries = agent.skills if agent.skills is not None else runtime_skills
+        # A provider that declares skills=False already produced an error
+        # above; re-reporting resolution failures for it would be noise.
+        if not entries or not caps.skills:
+            return
+        # Only *relative* entries need a base directory. ``~/skills`` becomes
+        # absolute under expanduser(), so it is checkable too — narrowing here
+        # rather than on is_path_entry() keeps absolute entries validated
+        # instead of silently waved through.
+        unresolvable = [
+            entry
+            for entry in entries
+            if is_path_entry(entry) and not Path(entry).expanduser().is_absolute()
+        ]
+        if skill_base_dir is None and unresolvable:
+            # Every other skip in this function has a second reporting path;
+            # this one has none, so say so rather than returning mute. Same
+            # don't-return-mute pattern as ``_caps_for``, at warning severity
+            # rather than error because the skill is still resolved at run time.
+            warnings.append(
+                f"Agent '{agent.name}': relative skill path(s) {sorted(unresolvable)!r} "
+                "were not checked because no workflow file path was supplied, so there "
+                "is no base directory to resolve them against. They are still resolved "
+                "at run time."
+            )
+            return
+
+        key = tuple(entries)
+        if key not in skill_cache:
+            try:
+                skill_cache[key] = resolve_skills(
+                    list(entries), base_dir=skill_base_dir, on_warning=warnings.append
+                )
+            except SkillError as exc:
+                skill_cache[key] = str(exc)
+        resolved = skill_cache[key]
+        if isinstance(resolved, str):
+            errors.append(f"Agent '{agent.name}': {resolved}")
+            return
+
+        if provider_name == "claude-agent-sdk":
+            for item in resolved:
+                try:
+                    plugin = resolve_skill_plugin(item.directory)
+                except SkillPluginError as exc:
+                    errors.append(
+                        f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                        f"{item.directory}, whose Claude Code plugin cannot be "
+                        f"loaded: {exc}"
+                    )
+                    continue
+                if plugin is None:
+                    errors.append(
+                        f"Agent '{agent.name}': skill {item.source!r} resolves to "
+                        f"{item.directory}, which is not inside a Claude Code "
+                        f"plugin. Provider 'claude-agent-sdk' can only enable a "
+                        f"skill through the plugin that owns it — it has no "
+                        f"skill-directory option. Package the skill as a plugin "
+                        f"(add ../.claude-plugin/plugin.json and move the skill "
+                        f"under <plugin>/skills/), or run this agent on 'copilot', "
+                        f"which loads skill directories directly."
+                    )
+
+        if uses_native_skills(provider_name) is False:
+            _check_skill_injection_budget(agent, provider_name, resolved)
+
+    def _check_skill_injection_budget(
+        agent: AgentDef, provider_name: str, resolved: list[ResolvedSkill]
+    ) -> None:
+        """Apply ``runtime.skill_injection`` limits statically.
+
+        Measures the exact string ``AgentExecutor`` would prepend, so the
+        numbers reported here match the ones enforced at run time.
+        """
+        # Reading the content can fail on an unreadable ``references/*.md``,
+        # which ``read_skill_frontmatter`` never opens and so cannot have
+        # caught upstream. Collect it like any other validation failure —
+        # letting it escape prints a traceback out of ``conductor validate``.
+        try:
+            content = load_skill_content([(item.name, item.directory) for item in resolved])
+        except SkillError as exc:
+            errors.append(f"Agent '{agent.name}': {exc}")
+            return
+        if not content:
+            return
+        size = len(content.encode("utf-8"))
+        approx_tokens = size // BYTES_PER_TOKEN_ESTIMATE
+        detail = (
+            f"Agent '{agent.name}' eagerly injects {size:,} bytes "
+            f"(~{approx_tokens:,} tokens) of skill content on every call: provider "
+            f"'{provider_name}' has no progressive disclosure, so this is paid "
+            f"again on every retry."
+        )
+        if skill_limits.max_bytes is not None and size > skill_limits.max_bytes:
+            errors.append(
+                f"{detail} That is over the runtime.skill_injection.max_bytes "
+                f"limit of {skill_limits.max_bytes:,}. Enable fewer skills, trim "
+                f"their references/ trees, run the agent on a provider with "
+                f"progressive disclosure (copilot, claude-agent-sdk), or raise "
+                f"the limit."
+            )
+        elif skill_limits.warn_bytes is not None and size > skill_limits.warn_bytes:
+            warnings.append(
+                f"{detail} That is over the runtime.skill_injection.warn_bytes "
+                f"threshold of {skill_limits.warn_bytes:,}."
             )
 
     def _check_agent_capabilities(
@@ -1776,6 +1933,8 @@ def _validate_provider_capabilities(
                 f"(capabilities.skills=False). Remove the skills, opt out with "
                 f"'skills: []', or override the agent to a skill-aware provider."
             )
+
+        _check_agent_skills(agent, provider_name, caps)
 
     # All provider-backed agents that run at workflow scope: top-level agents
     # PLUS for_each inline agents (``ForEachDef.agent``), which inherit the

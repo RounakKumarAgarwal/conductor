@@ -20,6 +20,8 @@ imports of provider modules so callers don't need to instantiate providers
 
 from __future__ import annotations
 
+import inspect
+import logging
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -28,6 +30,8 @@ from conductor.providers.reasoning import ReasoningEffort
 
 if TYPE_CHECKING:
     from conductor.providers.base import AgentProvider
+
+logger = logging.getLogger(__name__)
 
 
 # Stable / experimental are the only tiers for v1. Promotion criteria for
@@ -353,6 +357,65 @@ def known_provider_names() -> tuple[str, ...]:
     return tuple(_PROVIDER_CLASS_PATHS) + tuple(_NOT_YET_IMPLEMENTED_PROVIDERS)
 
 
+def uses_native_skills(provider_type: str) -> bool | None:
+    """Whether a provider loads skills natively, resolved without instantiating.
+
+    Mirrors :func:`get_capabilities`' lazy-import approach so it is safe to
+    call from ``conductor validate``. Providers declare
+    ``supports_native_skills`` as an instance ``property``, so this reads the
+    descriptor and evaluates it with no instance.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        ``True`` when the provider forwards skill directories to its SDK,
+        ``False`` when :class:`~conductor.executor.agent.AgentExecutor`
+        eagerly injects skill content instead, or ``None`` when the answer
+        cannot be determined without constructing the provider — the
+        property consults instance state, the provider is unknown or not
+        yet implemented, or the declaration cannot be read without side
+        effects.
+        Callers should skip mechanism-specific static checks on ``None``
+        rather than assume either branch.
+    """
+    if provider_type in _NOT_YET_IMPLEMENTED_PROVIDERS:
+        return None
+    dotted_path = _PROVIDER_CLASS_PATHS.get(provider_type)
+    if dotted_path is None:
+        return None
+
+    module_path, _, class_name = dotted_path.partition(":")
+    import importlib
+
+    try:
+        provider_cls = getattr(importlib.import_module(module_path), class_name)
+    except (ImportError, AttributeError):
+        return None
+
+    declared = inspect.getattr_static(provider_cls, "supports_native_skills", None)
+    if isinstance(declared, bool):
+        return declared
+    if isinstance(declared, property) and declared.fget is not None:
+        try:
+            return bool(declared.fget(None))
+        except (AttributeError, TypeError):
+            # The property dereferences ``self``, so the only honest answer is
+            # "ask a real instance". Split from the broader handler below so
+            # this expected case stays silent while a genuine bug inside the
+            # property is still logged rather than vanishing into "undetermined".
+            return None
+        except Exception:
+            logger.warning(
+                "Provider %r raised while resolving supports_native_skills "
+                "statically; treating the mechanism as undetermined.",
+                provider_type,
+                exc_info=True,
+            )
+            return None
+    return None
+
+
 __all__ = [
     "ProviderCapabilities",
     "ProviderTier",
@@ -360,4 +423,5 @@ __all__ = [
     "StructuredOutputMode",
     "get_capabilities",
     "known_provider_names",
+    "uses_native_skills",
 ]
