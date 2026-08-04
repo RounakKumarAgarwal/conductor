@@ -67,7 +67,100 @@ def validate_workflow(
         display_validation_error(e, workflow_path, output_console)
         return False, None
 
+    _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
+
     return True, config
+
+
+def _report_skill_discovery(
+    config: WorkflowConfig,
+    workflow_path: Path,
+    console: Console,
+    already_reported: list[str],
+) -> None:
+    """Print what ``runtime.skill_discovery`` puts in effect on this machine.
+
+    Discovery's one real cost is that the same YAML picks up a different
+    skill set on a different machine or in CI. That is only defensible if
+    the author can see the set, so listing it is part of the feature
+    rather than a debugging aid.
+
+    Resolves rather than merely scanning, so the listing is the set an
+    inheriting agent actually gets: a skill with broken frontmatter or a
+    name already claimed in ``skills:`` is excluded here exactly as it is
+    at run time. Skills an individual provider then declines to load
+    (``claude-agent-sdk`` outside a plugin) are per-agent and reported as
+    warnings by the validator instead.
+
+    Diagnostics are forwarded unless the validator already printed them.
+    They cannot simply be discarded: the validator only resolves skills
+    for agents that *inherit* the workflow list, so a workflow whose
+    agents all declare their own ``skills:`` never runs discovery there,
+    and this becomes the only place a broken ambient location is ever
+    mentioned.
+
+    Never fatal — turning a summary into a second source of validation
+    errors would be worse than an incomplete summary.
+
+    Args:
+        config: The validated workflow configuration.
+        workflow_path: Path to the workflow file, anchoring ``project``.
+        console: Rich console for output.
+        already_reported: Warnings the validator has printed, so the same
+            line is not shown twice.
+    """
+    discovery = config.workflow.runtime.skill_discovery
+    if not discovery.is_enabled:
+        return
+
+    from conductor.skills import (
+        BYTES_PER_TOKEN_ESTIMATE,
+        load_skill_content,
+        resolve_effective_skills,
+    )
+
+    seen = set(already_reported)
+
+    def _forward(message: str) -> None:
+        if message in seen:
+            return
+        seen.add(message)
+        console.print(f"  [yellow]⚠[/yellow] {message}")
+
+    try:
+        resolved = resolve_effective_skills(
+            list(config.workflow.runtime.skills),
+            sources=discovery.sources,
+            exclude=discovery.exclude,
+            base_dir=workflow_path.resolve().parent,
+            on_warning=_forward,
+        )
+    except Exception as exc:  # pragma: no cover - defensive; a report must not crash
+        console.print(f"  [yellow]⚠[/yellow] Skill discovery could not be summarized: {exc}")
+        return
+
+    found = [skill for skill in resolved if skill.discovered]
+    sources = ", ".join(discovery.sources)
+    if not found:
+        console.print(f"  [dim]Skill discovery ({sources}): no skills found[/dim]")
+        return
+
+    console.print(f"  [dim]Skill discovery ({sources}): {len(found)} skill(s)[/dim]")
+    for skill in found:
+        console.print(f"    [dim]• {skill.name} — {skill.source}[/dim]")
+
+    try:
+        content = load_skill_content([(skill.name, skill.directory) for skill in resolved])
+    except Exception as exc:
+        console.print(f"  [yellow]⚠[/yellow] Skill content could not be measured: {exc}")
+        return
+    size = len(content.encode("utf-8"))
+    # Covers declared skills too, since an eager-injection provider would
+    # be sent the whole set — the budget it is compared against is total.
+    console.print(
+        f"    [dim]Total if eagerly injected: {size:,} bytes "
+        f"(~{size // BYTES_PER_TOKEN_ESTIMATE:,} tokens)[/dim]"
+    )
 
 
 def display_validation_error(
