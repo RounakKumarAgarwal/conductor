@@ -1209,6 +1209,143 @@ class TestReplayEventsFromJsonl:
             "agent_completed",
         ]
 
+    def test_skips_paused_events_so_resume_does_not_look_stopped(self, tmp_path: Path) -> None:
+        """A pause left unresolved in the original log must not replay.
+
+        ``agent_paused`` latches the frontend's global ``isPaused`` flag,
+        which swaps the header's Stop button for Resume/Kill. Its only
+        counterparts (``agent_resumed``, root ``workflow_completed`` /
+        ``workflow_failed``) are absent from a killed run's log or filtered
+        here, so replaying it makes a healthy resumed run look stopped and
+        leaves it with no way to be stopped.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {"type": "agent_started", "timestamp": 1.0, "data": {"agent_name": "a"}},
+                {
+                    "type": "agent_paused",
+                    "timestamp": 1.5,
+                    "data": {"agent_name": "a", "partial_content": "{}"},
+                },
+                {"type": "workflow_failed", "timestamp": 2.0, "data": {"error": "stopped"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_started"]
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [
+            "agent_paused",
+            "agent_resumed",
+            "iteration_limit_reached",
+            "iteration_limit_resolved",
+            "dialog_started",
+            "dialog_completed",
+        ],
+    )
+    @pytest.mark.parametrize("sub_path", [None, ["sub"], ["sub", "deeper"]])
+    def test_skips_interactive_events_at_every_depth(
+        self, tmp_path: Path, event_type: str, sub_path: list[str] | None
+    ) -> None:
+        """Interaction events are dropped regardless of ``subworkflow_path``.
+
+        The pause/gate/dialog control channel belongs to the root dashboard
+        no matter which engine emitted the event, so — unlike the root
+        lifecycle events — depth must never exempt them. Folding any of these
+        into the depth-gated set reinstates the latch for subworkflow-emitted
+        pauses, gates, and dialogs.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        data: dict[str, object] = {"agent_name": "a"}
+        if sub_path is not None:
+            data["subworkflow_path"] = sub_path
+        self._write_jsonl(
+            log,
+            [
+                {"type": event_type, "timestamp": 1.0, "data": data},
+                {"type": "agent_completed", "timestamp": 2.0, "data": {"agent_name": "a"}},
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["agent_completed"]
+
+    def test_skip_sets_are_disjoint(self) -> None:
+        """The two skip sets have different depth semantics.
+
+        Membership in both is ambiguous, and moving an interaction event into
+        the depth-gated set silently exempts it at subworkflow depth.
+        """
+        assert WebDashboard._REPLAY_INTERACTIVE_SKIP_TYPES.isdisjoint(
+            WebDashboard._REPLAY_ROOT_SKIP_TYPES
+        )
+
+    @pytest.mark.parametrize("event_type", ["gate_presented", "gate_resolved", "dialog_message"])
+    def test_preserves_events_with_only_node_local_state(
+        self, tmp_path: Path, event_type: str
+    ) -> None:
+        """Events that set only *node-local* state are deliberately replayed.
+
+        ``gate_presented`` sets ``status: 'waiting'`` on its own node rather
+        than a global store latch, so it cannot latch the resumed run — and
+        dropping it would erase a genuine pending gate, its prompt, and its
+        options from the resumed timeline. Widening the interactive skip set
+        to cover these is a regression, not a tightening.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log, [{"type": event_type, "timestamp": 1.0, "data": {"agent_name": "a"}}]
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == [event_type]
+
+    def test_preserves_dialog_message_when_dialog_started_is_skipped(self, tmp_path: Path) -> None:
+        """Only the dialog's lifecycle bookends are skipped, not every dialog event.
+
+        ``dialog_message`` carries no global latch, so the skip set stays as
+        narrow as the bug requires. The replayed messages are inert rather
+        than useful: with ``dialog_started`` filtered, nothing renders
+        ``node.dialog_messages`` (both renderers gate on ``dialog_active`` /
+        ``activeDialog``, which only ``dialog_started`` sets). This pins the
+        filter's boundary, not a visible transcript.
+        """
+        emitter, dashboard = _make_dashboard()
+        log = tmp_path / "test.events.jsonl"
+        self._write_jsonl(
+            log,
+            [
+                {
+                    "type": "dialog_started",
+                    "timestamp": 1.0,
+                    "data": {"agent_name": "a", "dialog_id": "d1"},
+                },
+                {
+                    "type": "dialog_message",
+                    "timestamp": 1.1,
+                    "data": {"agent_name": "a", "role": "agent", "content": "hi"},
+                },
+            ],
+        )
+
+        count = dashboard.replay_events_from_jsonl(log)
+
+        assert count == 1
+        assert [ev["type"] for ev in dashboard._event_history] == ["dialog_message"]
+
     def test_preserves_subworkflow_lifecycle_events(self, tmp_path: Path) -> None:
         """Subworkflow-level workflow_started/completed (identified by a non-empty
         ``data.subworkflow_path``) must be preserved so frontend wfDepth stays
