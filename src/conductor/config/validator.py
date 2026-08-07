@@ -178,6 +178,20 @@ def validate_workflow_config(
                             f"routes to unknown agent or parallel group '{option.route}'"
                         )
 
+        # Validate the questions abort route. It is a real graph edge taken
+        # only after the human has worked through the node, so an unknown
+        # target must not wait until then to surface.
+        if (
+            agent.type == "questions"
+            and agent.abort_route is not None
+            and agent.abort_route != "$end"
+            and agent.abort_route not in all_names
+        ):
+            errors.append(
+                f"Agent '{agent.name}' abort_route targets unknown agent or "
+                f"parallel group '{agent.abort_route}'"
+            )
+
         # Validate input references
         input_errors, input_warnings = _validate_input_references(
             agent.name,
@@ -236,6 +250,13 @@ def validate_workflow_config(
                 f"For-each group '{for_each_group.name}' uses a terminate step as its "
                 "inline agent. Terminate steps cannot run inside a for_each iteration; "
                 "route to a terminate step from the for_each group's routes instead."
+            )
+        if for_each_group.agent.type == "questions":
+            errors.append(
+                f"For-each group '{for_each_group.name}' uses a questions step as its "
+                "inline agent. Concurrent iterations would compete for one terminal and "
+                "one dashboard prompt slot; route to a questions step from the for_each "
+                "group's routes instead."
             )
 
     # Validate sub-workflow references (local paths and registry refs).
@@ -522,6 +543,15 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                     "Human gates cannot be used in parallel groups."
                 )
 
+            # Validate no questions steps in parallel groups. Concurrent
+            # prompts would compete for one terminal and one dashboard gate
+            # slot, for the same reason human gates are refused above.
+            if agent.type == "questions":
+                errors.append(
+                    f"Agent '{agent_name}' in parallel group '{pg.name}' is a questions step. "
+                    "Questions steps cannot be used in parallel groups."
+                )
+
             # Validate no script steps in parallel groups
             if agent.type == "script":
                 errors.append(
@@ -639,6 +669,10 @@ def _build_routing_graph(config: WorkflowConfig) -> dict[str, list[tuple[str, bo
         elif agent.type == "human_gate" and agent.options:
             for option in agent.options:
                 edges.append((option.route, True))
+        # An abort route is a conditional edge like any other; without it an
+        # agent reachable only via abort is invisible to path analysis.
+        if agent.type == "questions" and agent.allow_abort:
+            edges.append((agent.abort_route or "$end", True))
         graph[agent.name] = edges
     for pg in config.parallel:
         graph[pg.name] = [(r.to, r.when is not None) for r in pg.routes]
@@ -1071,6 +1105,16 @@ def _collect_template_strings(
             for key, expr in agent.output_template.items():
                 templates.append((f"agent '{agent.name}' output_template.{key}", expr))
 
+    # Questions steps: text/hint/choices are Jinja2-rendered by the engine, so
+    # bad refs must fail at validate-time like every other rendered field.
+    if isinstance(agent, _AgentDef) and agent.questions:
+        for i, question in enumerate(agent.questions):
+            templates.append((f"agent '{agent.name}' questions[{i}].text", question.text))
+            if question.hint:
+                templates.append((f"agent '{agent.name}' questions[{i}].hint", question.hint))
+            for j, choice in enumerate(question.choices or []):
+                templates.append((f"agent '{agent.name}' questions[{i}].choices[{j}]", choice))
+
     return templates
 
 
@@ -1371,8 +1415,9 @@ def _validate_template_references(
             refs = _extract_template_refs(template)
 
             # Explicit-mode exclusions:
-            # - human_gate prompts render with the full accumulated context
-            #   (engine uses ``WorkflowContext.get_for_template()`` which forces
+            # - human_gate and questions prompts render with the full
+            #   accumulated context (engine uses
+            #   ``WorkflowContext.get_for_template()`` which forces
             #   ``mode="accumulate"``), so they're never subject to
             #   explicit-mode warnings.
             # - script and workflow (sub-workflow) agents are excluded only for
@@ -1382,7 +1427,10 @@ def _validate_template_references(
             #   Their ``agent.output`` references still require declaration —
             #   the engine raises ``KeyError`` via ``_add_explicit_input`` if
             #   an undeclared agent output is accessed.
-            agent_output_warning_allowed = is_explicit and agent.type != "human_gate"
+            agent_output_warning_allowed = is_explicit and agent.type not in (
+                "human_gate",
+                "questions",
+            )
 
             # --- Agent-output references (``a.output[.field]``) ---
             for ref_root, ref_fields in refs.agent_output_fields.items():
@@ -1509,7 +1557,8 @@ def _validate_template_references(
                     )
                 elif (
                     is_explicit
-                    and agent.type not in ("script", "set", "workflow", "human_gate", "wait")
+                    and agent.type
+                    not in ("script", "set", "workflow", "human_gate", "questions", "wait")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(
@@ -1542,9 +1591,9 @@ def _validate_template_references(
 # Provider capability cross-checks (issue #241)
 # ---------------------------------------------------------------------------
 
-# Agent types that drive a provider. All other types (human_gate, script,
-# set, terminate, wait, workflow) do not invoke a provider directly and are
-# skipped by every capability check.
+# Agent types that drive a provider. All other types (human_gate, questions,
+# script, set, terminate, wait, workflow) do not invoke a provider directly and
+# are skipped by every capability check.
 _LLM_AGENT_TYPES = frozenset({None, "agent"})
 
 
