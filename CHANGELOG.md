@@ -167,6 +167,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A pricing hook that silently prices nothing is now reported** (#386). #265
+  warns when the provider pricing hook *raises*; the companion case — a hook
+  that never raises and returns `None` for everything — looked identical to
+  "these models are simply unpriced", so live pricing could be dead for a whole
+  run with no symptom beyond newer models showing up as unpriced. The verdict is
+  drawn once when the run ends — however it ends, so a run that dies part way
+  still reports it, which is when a partial cost total most needs the caveat —
+  and is emitted as a `pricing_hook_silent` event as well as a log line, so it
+  reaches the event log and the console rather than only unattributed stderr.
+  The run summary gains `usage.live_pricing_degraded` and the cost breakdown
+  prints a matching caveat, because a model priced from the static table still
+  reports a confident cost and would otherwise carry no qualification.
+  Providers that do not implement the hook are excluded: returning
+  `None` is the documented default, so counting them accused four of the five
+  providers of a broken SDK for behaving correctly.
 - **`conductor stop` now confirms the process actually stopped, and never
   stops the wrong one** (#344). `stop` sent one signal and reported success
   without checking, so a workflow that ignored it was reported as stopped and
