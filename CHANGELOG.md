@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`conductor status` — see what is running without stopping it** (#384).
+  `conductor stop` with no arguments lists background workflows, but stops one
+  when exactly one is running, so the natural "what's running?" reflex was
+  destructive precisely when there was a single run to lose. `status` never
+  terminates anything and never removes a PID file, so a run stays
+  discoverable even when its liveness cannot be confirmed. It prints each
+  run's dashboard URL, which is otherwise unrecoverable once the launching
+  terminal is gone, and `--json` makes it scriptable. A malformed PID file is
+  skipped with a warning rather than taking down the listing.
 - **Git-backed plugin sources** (#380). `runtime.plugins` alone resolves
   against machine state — an installed plugin name, or a path — so a workflow
   shared with a teammate still needed "first install these plugins" in a
