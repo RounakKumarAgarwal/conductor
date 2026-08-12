@@ -335,6 +335,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hand with a 19-character naive `started_at`, well short of production's
   32-character value — it now goes through the real `write_pid_file`, so the
   widths under test match the widths production writes.
+- **JSON result output no longer crashes on a legacy Windows stdout** (#342).
+  On a `cp1252` console, `conductor run` exited non-zero with
+  `UnicodeEncodeError` *after* the workflow had already succeeded, having
+  written a truncated document callers could not parse. `json.dumps` emits
+  ASCII by default, but rich's `print_json` re-parses and re-serialises with
+  `ensure_ascii=False` immediately before the write, restoring the character it
+  had escaped. Every JSON sink now passes `ensure_ascii=True`. Results carry
+  `\uXXXX` escapes on all platforms as a result, which is valid JSON and decodes
+  identically. `conductor doctor`'s default *table* output is unaffected by this
+  change and still fails on such a console (#401).
 - **Agent text containing bracketed tokens no longer kills a run** (#382). A
   step whose output contained ordinary technical prose such as
   `{provider}/{type}[/{nestedType}...]/read` was parsed by rich as a closing
