@@ -259,6 +259,43 @@ def _print_web_bg_human_gate_notice(url: str) -> None:
     )
 
 
+def _print_web_bg_not_started_notice() -> None:
+    """Note that the launcher's wait deadline passed without a confirmed start.
+
+    Not a failure: the child is still alive and listening — it just hasn't
+    reported a ``workflow_started`` event yet (issue #410). Printed only in
+    verbose mode, alongside the dashboard URL / stderr log lines above it.
+    """
+    console.print(
+        Text.from_markup(
+            "[yellow]Note:[/yellow] the workflow has not reported starting "
+            "yet. It may still be initializing (plugin fetch, MCP server "
+            "startup, provider connection) — check the dashboard or the "
+            "stderr log above. Set [bold]CONDUCTOR_WEB_BG_START_TIMEOUT[/bold] "
+            "to tune how long the launcher waits before printing this note."
+        )
+    )
+
+
+def _print_web_bg_completed_notice(stderr_log: Path) -> None:
+    """Note that the workflow already finished before the launcher returned.
+
+    Covers the two ``BackgroundLaunch.still_running=False`` cases: a
+    sub-second run that completed before the dashboard port ever opened, or
+    one that finished during the stage-two workflow-start wait. Either way
+    the dashboard has already shut down, so printing its URL / "running in
+    background" would describe a process that no longer exists — the false
+    success this PR closes (issue #410). Printed only in verbose mode.
+    """
+    console.print(
+        styled(
+            "[green]Workflow completed[/green] before the background launcher "
+            "finished waiting. See child stderr log: {} for output.",
+            stderr_log,
+        )
+    )
+
+
 def version_callback(value: bool) -> None:
     """Display version information and exit."""
     if value:
@@ -565,16 +602,25 @@ def run(
                 print_loaded_instructions=print_loaded_instructions,
             )
             if is_verbose():
-                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
-                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
-                console.print(
-                    Text.from_markup(
-                        "[dim]Workflow running in background. Dashboard auto-shuts down after "
-                        "workflow completes and all clients disconnect.[/dim]"
+                if not launch.still_running:
+                    # The child already exited (cleanly) before the launcher
+                    # finished waiting — the dashboard is gone, so printing
+                    # its URL / "running in background" would describe a
+                    # process that no longer exists (issue #410).
+                    _print_web_bg_completed_notice(launch.stderr_log)
+                else:
+                    console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                    console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
+                    console.print(
+                        Text.from_markup(
+                            "[dim]Workflow running in background. Dashboard auto-shuts down after "
+                            "workflow completes and all clients disconnect.[/dim]"
+                        )
                     )
-                )
-                if notify_gate:
-                    _print_web_bg_human_gate_notice(launch.url)
+                    if not launch.workflow_started:
+                        _print_web_bg_not_started_notice()
+                    if notify_gate:
+                        _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
@@ -1066,16 +1112,26 @@ def resume(
                 guidance=guidance,
             )
             if is_verbose():
-                console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
-                console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
-                console.print(
-                    Text.from_markup(
-                        "[dim]Resumed workflow running in background. Dashboard auto-shuts down "
-                        "after workflow completes and all clients disconnect.[/dim]"
+                if not launch.still_running:
+                    # The child already exited (cleanly) before the launcher
+                    # finished waiting — the dashboard is gone, so printing
+                    # its URL / "running in background" would describe a
+                    # process that no longer exists (issue #410).
+                    _print_web_bg_completed_notice(launch.stderr_log)
+                else:
+                    console.print(styled("[bold cyan]Dashboard:[/bold cyan] {}", launch.url))
+                    console.print(styled("[dim]Child stderr log: {}[/dim]", launch.stderr_log))
+                    console.print(
+                        Text.from_markup(
+                            "[dim]Resumed workflow running in background. Dashboard "
+                            "auto-shuts down after workflow completes and all clients "
+                            "disconnect.[/dim]"
+                        )
                     )
-                )
-                if notify_gate:
-                    _print_web_bg_human_gate_notice(launch.url)
+                    if not launch.workflow_started:
+                        _print_web_bg_not_started_notice()
+                    if notify_gate:
+                        _print_web_bg_human_gate_notice(launch.url)
         except Exception as e:
             print_error(e)
             raise typer.Exit(code=1) from None
