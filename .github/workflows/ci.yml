@@ -7,7 +7,8 @@
 # Jobs:
 # - lint: Runs ruff linter and formatter check
 # - typecheck: Runs ty (Red Knot) type checker
-# - test: Runs pytest with coverage on Python 3.12 and 3.13
+# - test: Runs pytest with coverage on Python 3.12 + 3.13 (Ubuntu) and 3.13
+#         (Windows, where the platform-specific code actually lives)
 # - validate-examples: Validates all example workflow YAML files
 # - build: Verifies the package builds correctly
 # - frontend: Type-checks, tests (Vitest), and builds the web dashboard
@@ -81,12 +82,27 @@ jobs:
         run: uv run ty check src
 
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: [lint, typecheck]
     strategy:
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.12", "3.13"]
+        # Windows carries a substantial amount of platform-specific code —
+        # cli/pid.py is an entire OpenProcess/GetExitCodeProcess ctypes
+        # implementation, cli/bg_runner.py handles process groups and job-object
+        # breakaway — and none of it was executed anywhere. The existing tests
+        # cover that logic on Linux by monkey-patching a `_kernel32` mock, which
+        # is good design but means nothing validates the real ctypes signatures.
+        #
+        # Deliberately ONE Python version on Windows rather than a full 2x2: the
+        # platform is the variable here, not the interpreter, and the
+        # install-scripts job already provisions a Windows runner on every PR so
+        # this is incremental cost rather than a new platform commitment.
+        include:
+          - os: windows-latest
+            python-version: "3.13"
       fail-fast: false
 
     steps:
@@ -109,11 +125,33 @@ jobs:
         run: uv sync --group dev --extra claude-agent-sdk
 
       - name: Remove bundled Copilot CLI binary
+        # `shell: bash` so this runs identically on the Windows runner (Git Bash
+        # is preinstalled). Without it the step fails on Windows, where a bare
+        # `find` resolves to the unrelated DOS search tool in System32.
+        shell: bash
         run: |
+          set -euo pipefail
           # The github-copilot-sdk >=0.1.23 bundles a CLI binary that tries to
           # authenticate with GitHub on startup. Remove it so tests that invoke
           # the real CLI path fail fast instead of hanging on auth.
-          find .venv -path '*/copilot/bin/copilot*' -delete 2>/dev/null || true
+          #
+          # The binary ships inside the package (copilot/bin/), not in the venv's
+          # scripts directory — there is no console-script entry point — so one
+          # pattern covers both platforms: the leading */ absorbs lib/pythonX.Y/
+          # or Lib/, and the trailing * absorbs the .exe suffix on Windows.
+          #
+          # Checked rather than best-effort: `find` exits 0 when it matches
+          # nothing, so a silent no-op reinstates the auth hang this step exists
+          # to prevent, and it surfaces ten minutes later as a bare job timeout
+          # naming neither the CLI nor this step.
+          removed=$(find .venv -path '*/copilot/bin/copilot*' -print -delete)
+          if [ -z "$removed" ]; then
+            echo "::error::No bundled Copilot CLI matched '*/copilot/bin/copilot*'."
+            echo "The github-copilot-sdk layout changed — update this pattern, or"
+            echo "tests taking the real CLI path will hang until the job timeout."
+            exit 1
+          fi
+          echo "Removed: $removed"
 
       - name: Run tests with coverage
         timeout-minutes: 10
@@ -128,7 +166,9 @@ jobs:
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
-        if: matrix.python-version == '3.12'
+        # One upload per commit. Without the os guard a second runner would
+        # upload a partial report for the same commit and skew the totals.
+        if: matrix.python-version == '3.12' && matrix.os == 'ubuntu-latest'
         with:
           file: ./coverage.xml
           fail_ci_if_error: false
