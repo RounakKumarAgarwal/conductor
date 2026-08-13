@@ -16,8 +16,9 @@ Three layers, none of them individually load-bearing:
    the default. ``CONDUCTOR_GATE_TOKEN`` overrides it when set (the
    documented escape hatch predating this change).
 3. A token *file* at ``~/.conductor/runs/dashboard-<port>.token`` (mode
-   ``0600``) so a CLI invocation with no explicit ``--token`` and no env
-   var set can still discover the running dashboard's token.
+   ``0600`` on POSIX; see :func:`write_token_file` for the Windows caveat)
+   so a CLI invocation with no explicit ``--token`` and no env var set can
+   still discover the running dashboard's token.
 
 Read-only routes (``GET /api/state``, ``/api/info``, ``/api/logs``,
 ``/api/gate-status``, ``/api/files/*``, the replay app) are protected by
@@ -88,11 +89,17 @@ def token_file_path(port: int) -> Path:
 
 
 def write_token_file(port: int, token: str) -> Path:
-    """Write the dashboard token file for ``port``, mode ``0600``.
+    """Write the dashboard token file for ``port``, mode ``0600`` on POSIX.
 
     Written atomically (temp file + ``os.replace``), mirroring
     ``cli/pid.py::write_pid_file``'s reasoning: a reader must never observe
     a partially-written token.
+
+    The ``0600`` mode is honoured on POSIX only. On Windows, ``os.open``'s
+    ``pmode`` argument only ever toggles the read-only attribute, so on
+    Windows the file's protection comes from the inherited ACL of its parent
+    directory (``rundir.runs_dir()``, i.e. ``%USERPROFILE%\\.conductor\\runs``
+    by default) rather than from per-owner permission bits.
 
     Args:
         port: The bound dashboard port.
