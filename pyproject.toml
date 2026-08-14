@@ -66,6 +66,13 @@ aca = [
     # async credential raises ImportError at runtime (see aca.py).
     "azure-core[aio]>=1.29.0",
 ]
+tui = [
+    # Floor is 8.x, not a looser bound: `BlockFooter` (fleet/tui/widgets.py)
+    # is written against 8.x `Footer` group rendering, and the
+    # `App.run_test()` / `Pilot` behavior every TUI pilot test depends on
+    # changed before it.
+    "textual>=8.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/microsoft/conductor"
@@ -103,6 +110,9 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.8.0",
     "ty>=0.0.1a0",
+    # So Fleet Manager TUI pilot tests (App.run_test()) run in CI/dev without
+    # requiring an end user to install the `tui` extra just to run the suite.
+    "textual>=8.0",
 ]
 
 [tool.ruff]

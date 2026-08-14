@@ -297,8 +297,11 @@ class TestLaunchBackgroundSilentFlag:
         with (
             patch("conductor.cli.bg_runner.subprocess.Popen", side_effect=_fake_popen),
             patch("conductor.cli.bg_runner._wait_for_server", return_value=True),
+            patch(
+                "conductor.fleet.records.read_run_record",
+                return_value=MagicMock(pid=12345, mode="bg", port=9099),
+            ),
             patch("conductor.cli.bg_runner._resolve_start_timeout", return_value=0.0),
-            patch("conductor.cli.pid.write_pid_file"),
         ):
             launch = bg_runner.launch_background(
                 workflow_path=wf_path,
@@ -320,8 +323,14 @@ class TestLaunchBackgroundSilentFlag:
         assert "--web-port" in cmd
         assert "9099" in cmd
         assert "--no-interactive" in cmd
-        assert "--input" in cmd
-        assert "question=hello" in cmd
+        assert "--input-json" in cmd
+        # Inputs are always JSON-encoded and forwarded via the hidden,
+        # strictly-typed --input-json flag (not the public --input, whose
+        # heuristic would reinterpret an already-typed value) so a
+        # declared-string value round-trips correctly across the
+        # --web-bg boundary (see bg_runner.py::_serialize_input_value /
+        # cli/run.py::coerce_typed_value).
+        assert 'question="hello"' in cmd
         assert "--provider" in cmd and "copilot" in cmd
         assert "--skip-gates" in cmd
         assert "--metadata" in cmd

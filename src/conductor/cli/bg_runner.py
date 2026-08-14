@@ -81,7 +81,19 @@ _CREATE_BREAKAWAY_FROM_JOB: int = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB
 # ``JOB_OBJECT_LIMIT_BREAKAWAY_OK`` cleared (some hardened CI environments).
 _ERROR_ACCESS_DENIED = 5
 
-_RUN_ID_PATTERN_LOCAL = re.compile(r"[0-9a-f]{8}")
+# NOTE: run-id format validation here defers to
+# ``conductor.fleet.records.is_valid_run_id`` (imported lazily inside the
+# functions that need it, to avoid a hard import cycle at module load time)
+# rather than a hand-rolled hex-only regex. A resumed child reuses a
+# checkpoint's ``run_id`` verbatim -- ``EventLogSubscriber``'s
+# ``existing_path``/``existing_run_id`` branch performs no format check of
+# its own -- and the only thing that actually gates whether that id can be
+# used is whether the child's own ``write_run_record`` call accepts it as a
+# filename component. A local hex-only copy of that rule (this module used
+# to keep one) can reject a checkpoint ``run_id`` the child would happily
+# reuse, causing the parent to poll for a freshly generated id the resumed
+# child never writes its run record under (see ``_peek_resume_run_id``'s
+# docstring).
 
 
 def _detachment_kwargs() -> dict[str, Any]:
@@ -202,13 +214,12 @@ class BackgroundLaunch:
         stderr_log: Path to the file capturing the child's stderr — the
             first place to look when a bg run misbehaves silently.
         stdout_log: Path to the file capturing the child's stdout.
-        run_id: 8-hex-character run id that ties this bg launch to its
-            ``.events.jsonl`` peer via ``CONDUCTOR_RUN_ID``. On resume, this
-            is adopted from the checkpoint's ``run_id`` when resolvable (see
-            ``_checkpoint_run_id``), so the PID file, ``/api/info``, the
-            events JSONL, and the capture-log filenames all agree on one id
-            instead of the launcher minting an id that correlates with
-            nothing.
+        run_id: The run id that ties this bg launch to its ``.events.jsonl``
+            peer via ``CONDUCTOR_RUN_ID``. Normally exactly 8 lowercase hex
+            characters (a fresh ``secrets.token_hex(4)``), but a resumed
+            launch may force-carry a checkpoint's original run id instead
+            (see ``_peek_resume_run_id``), which is validated against the
+            same path-safe contract the fleet run-record store itself uses.
         workflow_started: Whether the launcher observed the workflow actually
             start (via ``GET /api/info`` reporting a ``workflow_started``
             event — see ``_wait_for_workflow_start``) before its wait
@@ -240,7 +251,9 @@ class BackgroundLaunch:
             latter is only meaningful when this one is ``True``.
 
     Invariants (enforced in ``__post_init__``):
-        * ``run_id`` is exactly 8 lowercase hex characters.
+        * ``run_id`` is a valid fleet run id -- see
+          ``conductor.fleet.records.is_valid_run_id``, the same contract
+          the child's own ``write_run_record`` call enforces.
         * ``url`` is a localhost URL (``http://127.0.0.1:<port>``).
         * ``run_id`` appears in both ``stderr_log.name`` and
           ``stdout_log.name`` — this is what lets the bg log files and
@@ -256,9 +269,11 @@ class BackgroundLaunch:
     still_running: bool = True
 
     def __post_init__(self) -> None:
-        if not _RUN_ID_PATTERN_LOCAL.fullmatch(self.run_id):
+        from conductor.fleet.records import is_valid_run_id
+
+        if not is_valid_run_id(self.run_id):
             raise ValueError(
-                f"BackgroundLaunch.run_id must be 8 lowercase hex chars, got: {self.run_id!r}"
+                f"BackgroundLaunch.run_id must be a valid run id, got: {self.run_id!r}"
             )
         if not self.url.startswith("http://127.0.0.1:"):
             raise ValueError(f"BackgroundLaunch.url must be a localhost URL, got: {self.url!r}")
@@ -320,8 +335,9 @@ def _terminate_child(proc: subprocess.Popen[Any]) -> None:
     """Best-effort terminate a still-running child process.
 
     Used to avoid orphaned background workflows when post-launch validation
-    (server reachability, PID file write) fails. Any errors raised while
-    terminating are swallowed so the original failure surfaces to the caller.
+    (server reachability, the child's run record appearing) fails. Any
+    errors raised while terminating are swallowed so the original failure
+    surfaces to the caller.
 
     Args:
         proc: The subprocess.Popen handle to terminate.
@@ -354,13 +370,15 @@ def _sanitize_name(name: str) -> str:
 
 
 def _open_bg_log_files(
-    workflow_ref: Path, *, run_id: str | None = None
+    workflow_ref: Path, *, forced_run_id: str | None = None
 ) -> tuple[str, Path, Path, IOBase, IOBase]:
     """Create the bg child's stderr/stdout log files and return open handles.
 
-    Opens two log files in ``$TMPDIR/conductor/`` whose names match the
-    convention used by ``EventLogSubscriber`` (timestamp + run id) so all
-    three artefacts of a single bg run group together by filename.
+    Generates a fresh 8-hex-character run id (unless ``forced_run_id`` is
+    given) and opens two log files in ``$TMPDIR/conductor/`` whose names
+    match the convention used by ``EventLogSubscriber`` (timestamp + run
+    id) so all three artefacts of a single bg run group together by
+    filename.
 
     The caller is responsible for closing the returned handles once
     ``subprocess.Popen`` has returned (the child has its own inherited OS
@@ -369,10 +387,13 @@ def _open_bg_log_files(
     Args:
         workflow_ref: The workflow file (or checkpoint) used to derive the
             ``<name>`` segment of the filename.
-        run_id: When given and it matches ``_RUN_ID_PATTERN_LOCAL`` (8
-            lowercase hex chars), reuse it instead of minting a fresh one —
-            used on resume so the whole launch adopts the checkpoint's run
-            id. Otherwise a fresh ``secrets.token_hex(4)`` id is generated.
+        forced_run_id: When given, use this run id instead of generating a
+            random one. Used by ``launch_background_resume`` when the
+            child is expected to reuse a checkpoint's original ``run_id``
+            (see ``_peek_resume_run_id``) — the parent must use the exact
+            same id for the bg log filenames, ``CONDUCTOR_RUN_ID``, and
+            the run-record poll key, or the D2 launch gate polls for an id
+            the child never writes.
 
     Returns:
         Tuple of ``(run_id, stderr_path, stdout_path, stderr_handle,
@@ -383,16 +404,14 @@ def _open_bg_log_files(
             cannot be opened. The caller is expected to surface this as a
             ``RuntimeError`` with context.
     """
-    resolved_run_id = (
-        run_id if run_id is not None and _RUN_ID_PATTERN_LOCAL.fullmatch(run_id) else None
-    ) or secrets.token_hex(4)
+    run_id = forced_run_id or secrets.token_hex(4)
     ts = time.strftime("%Y%m%d-%H%M%S")
     base = _sanitize_name(workflow_ref.stem) if workflow_ref.stem else "workflow"
     log_dir = Path(tempfile.gettempdir()) / "conductor"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    stderr_path = log_dir / f"conductor-{base}-{ts}-{resolved_run_id}.bg.stderr.log"
-    stdout_path = log_dir / f"conductor-{base}-{ts}-{resolved_run_id}.bg.stdout.log"
+    stderr_path = log_dir / f"conductor-{base}-{ts}-{run_id}.bg.stderr.log"
+    stdout_path = log_dir / f"conductor-{base}-{ts}-{run_id}.bg.stdout.log"
     # Line-buffered text mode so a tail of the file shows fresh output as
     # the child writes it. ``errors="replace"`` keeps the file readable
     # even if the child emits invalid UTF-8 (e.g. raw bytes from a
@@ -403,7 +422,7 @@ def _open_bg_log_files(
     stdout_handle = open(  # noqa: SIM115 - caller closes after Popen
         stdout_path, "w", encoding="utf-8", errors="replace", buffering=1
     )
-    return resolved_run_id, stderr_path, stdout_path, stderr_handle, stdout_handle
+    return run_id, stderr_path, stdout_path, stderr_handle, stdout_handle
 
 
 def _close_quietly(*handles: IOBase) -> None:
@@ -607,45 +626,91 @@ def _tail_log(path: Path, max_lines: int = 20, max_chars: int = 2000) -> str:
     return f"\n--- last {len(lines)} line(s) of {path} ---\n{tail}"
 
 
+def _remove_dead_child_record(run_id: str, child_pid: int) -> None:
+    """Remove the child's run record after the launcher gave up on it.
+
+    The counterpart to the old parent-side ``remove_pid_file_at`` cleanup:
+    the child writes the record (D2), so when the launcher terminates it or
+    finds it dead, the record it wrote would otherwise be left behind
+    advertising a process that is gone.
+
+    Identity-checked on ``pid`` for the same reason ``remove_pid_file_at``
+    re-read its file (issue #344): a resumed launch can carry a checkpoint's
+    original ``run_id``, so the record under this key may belong to a
+    different, live process. Never raises -- this is cleanup on a path that
+    is already reporting a failure, and masking that failure with a
+    secondary one would hide the reason the launch was abandoned.
+    """
+    try:
+        from conductor.fleet.records import read_run_record, remove_run_record
+
+        record = read_run_record(run_id)
+        if record is not None and record.pid == child_pid:
+            remove_run_record(run_id)
+    except Exception:  # noqa: BLE001 - cleanup must not mask the launch failure
+        logger.debug("Could not remove run record for run_id=%s", run_id, exc_info=True)
+
+
 def _finalize_background_launch(
     proc: subprocess.Popen[Any],
     web_port: int,
-    pid_workflow_ref: Path,
-    stderr_log: Path,
-    *,
     run_id: str,
-    stdout_log: Path,
+    stderr_log: Path,
 ) -> bool:
-    """Wait for the dashboard to come up, write the PID file, then confirm the workflow started.
+    """Wait for the dashboard, wait for the child's run record, then confirm it started.
 
-    On any failure (server didn't start, child died early, PID write raised),
-    the still-running child is terminated to avoid orphaned processes holding
-    the dashboard port without a discoverable PID file. The stderr log path
-    (with a bounded tail of its contents) is included in the RuntimeError so
-    callers can point users at the captured crash output.
+    On any failure (server didn't start, child died early, the child never
+    wrote its run record within the timeout), the still-running child is
+    terminated to avoid orphaned processes holding the dashboard port
+    without a discoverable record. The stderr log path (with a bounded tail
+    of its contents) is included in the ``RuntimeError`` so callers can
+    point users at the captured crash output.
 
-    The PID file records ``run_id`` and both capture-log paths so a bg run
-    can be correlated to its events JSONL (via ``run_id``) and its captured
-    stderr/stdout after the launching terminal is gone. It is written as
-    soon as the port opens — before the stage-two workflow-start wait —
-    because that wait can legitimately run up to 30s, and a run invisible to
-    ``conductor status``/``conductor stop`` for that whole window is worse
-    than a briefly-premature entry (issue #410). If the child then turns out
-    to be dead, the entry is removed via ``remove_pid_file_at``, which
-    re-reads the file and refuses to unlink one that no longer describes our
-    PID.
+    Per D2 (the child owns the write in every mode — see
+    ``docs/projects/fleet-manager/fleet-manager.design.md``), the detached
+    child is responsible for writing its own fleet run record (keyed by
+    ``run_id``) once it starts executing. This function is the parent-side
+    gate: it polls :func:`conductor.fleet.records.read_run_record` rather
+    than writing a PID/record file itself, so there is exactly one writer
+    (and hence exactly one record) per background run. This replaces the
+    parent-side ``write_pid_file`` the two-stage contract originally wrote
+    here; the run record supersedes the PID file and is written by the
+    child, so re-introducing a parent-side write would create a second
+    writer for one run.
+
+    The polled record must match this launch on three fields before the
+    gate accepts it as readiness -- a record merely found under the right
+    ``run_id`` is not proof by itself that *this* launch's child is up:
+
+    * ``pid`` must equal the spawned child's ``proc.pid`` (e.g. rules out
+      a stale record left behind under the same key by an unrelated
+      process, or -- in the forced-resume-run-id case -- a leftover record
+      from the *original*, now-dead run that the resumed child hasn't yet
+      overwritten).
+    * ``mode`` must be ``"bg"`` (rules out a record some other, differently
+      launched process happens to have written under a colliding key).
+    * ``port`` must equal ``web_port`` (rules out advertising an unrelated
+      service's record when the requested port was occupied and the child
+      fell back to a different, or no, port).
+
+    A failure while reading the record itself (as opposed to the record
+    simply not existing yet, which :func:`conductor.fleet.records.read_run_record`
+    already reports as ``None``) also terminates the child and raises,
+    rather than letting the exception escape uncontained and orphan the
+    background process.
+
+    Because the child writes its record as it starts executing, the record
+    poll is a *stronger* readiness signal than the PID write it replaces --
+    but it is still not proof the engine reached ``workflow_started``, so
+    the stage-two ``/api/info`` probe (issue #410) is retained below.
 
     Args:
         proc: The detached child process.
         web_port: The TCP port the child should be listening on.
-        pid_workflow_ref: Path used to derive the PID file name and recorded
-            inside it for ``conductor stop`` to display.
+        run_id: The run id shared with the child via ``CONDUCTOR_RUN_ID``,
+            used to look up its run record once written.
         stderr_log: Path to the file capturing the child's stderr. Included
             in failure messages so users know where to look.
-        run_id: The run id shared with the child via ``CONDUCTOR_RUN_ID``,
-            recorded in the PID file.
-        stdout_log: Path to the file capturing the child's stdout, recorded
-            in the PID file.
 
     Returns:
         ``True`` if the workflow was observed to start (or the stage-two
@@ -656,8 +721,9 @@ def _finalize_background_launch(
 
     Raises:
         RuntimeError: If the child died early (with a non-zero exit code),
-            the dashboard didn't start within the timeout, the PID file
-            could not be written, the child died before the workflow started
+            the dashboard didn't start within the timeout, the child never
+            wrote a matching run record within the timeout, reading the run
+            record itself failed, the child died before the workflow started
             (non-zero exit), or a foreign process already holds the port.
     """
     if not _wait_for_server(web_port, timeout=15.0, proc=proc):
@@ -679,23 +745,48 @@ def _finalize_background_launch(
             f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
         )
 
-    from conductor.cli.pid import remove_pid_file_at, write_pid_file
+    # The child's own run record, not a parent-side PID write (D2): one
+    # writer per run. This is stage one-and-a-half -- the port is open and
+    # the child has reached the point of registering itself.
+    from conductor.fleet.records import read_run_record
 
-    try:
-        pid_path = write_pid_file(
-            proc.pid,
-            web_port,
-            pid_workflow_ref,
-            run_id=run_id,
-            stderr_log=str(stderr_log),
-            stdout_log=str(stdout_log),
-        )
-    except Exception as exc:
-        _terminate_child(proc)
-        raise RuntimeError(
-            f"Failed to write PID file for background process: {exc}. "
-            f"See child stderr log: {stderr_log}"
-        ) from exc
+    deadline = time.monotonic() + 15.0
+    while True:
+        retcode = proc.poll()
+        if retcode is not None:
+            if retcode == 0:
+                # Completed inside the window; the child removed its own
+                # record on exit, so there is nothing to wait for.
+                return True
+            raise RuntimeError(
+                f"Background process exited immediately with code {retcode}. "
+                f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
+            )
+        try:
+            record = read_run_record(run_id)
+        except Exception as exc:
+            _terminate_child(proc)
+            raise RuntimeError(
+                f"Failed to read background process's run record "
+                f"(run_id={run_id}): {exc}. The background process was "
+                f"terminated. See child stderr log: "
+                f"{stderr_log}{_tail_log(stderr_log)}"
+            ) from exc
+        if (
+            record is not None
+            and record.pid == proc.pid
+            and record.mode == "bg"
+            and record.port == web_port
+        ):
+            break
+        if time.monotonic() >= deadline:
+            _terminate_child(proc)
+            raise RuntimeError(
+                f"Background process did not report a run record within 15 seconds "
+                f"(run_id={run_id}). The background process was terminated. "
+                f"See child stderr log: {stderr_log}{_tail_log(stderr_log)}"
+            )
+        time.sleep(0.2)
 
     start_timeout = _resolve_start_timeout()
     if start_timeout == 0:
@@ -720,9 +811,9 @@ def _finalize_background_launch(
         retcode = proc.poll()
         if retcode == 0:
             # Completed inside the window; the child already removed its
-            # own PID file.
+            # own run record.
             return True
-        remove_pid_file_at(pid_path, proc.pid)
+        _remove_dead_child_record(run_id, proc.pid)
         raise RuntimeError(
             "Background process exited before the workflow started "
             f"(code {retcode}). See child stderr log: "
@@ -731,7 +822,7 @@ def _finalize_background_launch(
 
     # probe is StartProbe.PORT_CONFLICT
     _terminate_child(proc)
-    remove_pid_file_at(pid_path, proc.pid)
+    _remove_dead_child_record(run_id, proc.pid)
     info = _probe_workflow_info(web_port)
     foreign_pid = info.get("pid") if info else "unknown"
     raise RuntimeError(
@@ -773,7 +864,7 @@ def _spawn_bg_child(
     cmd: list[str],
     web_port: int,
     pid_workflow_ref: Path,
-    run_id: str | None = None,
+    forced_run_id: str | None = None,
 ) -> BackgroundLaunch:
     """Open the bg log files, spawn the detached child, and finalize the launch.
 
@@ -787,12 +878,13 @@ def _spawn_bg_child(
         cmd: Fully assembled subprocess command (already includes ``--silent``,
             the subcommand, ``--web``, ``--no-interactive``, etc.).
         web_port: The TCP port the child should listen on.
-        pid_workflow_ref: Workflow or checkpoint path used both as the source
-            of the log filename stem and as the PID file's recorded reference.
-        run_id: Optional run id to adopt for this launch (e.g. resolved from a
-            checkpoint on resume) instead of minting a fresh one. Passed
-            through to :func:`_open_bg_log_files`, which falls back to a
-            fresh id if this doesn't match the expected 8-hex-char shape.
+        pid_workflow_ref: Workflow or checkpoint path used as the source of
+            the bg log filename stem (see ``_open_bg_log_files``).
+        forced_run_id: When given, use this run id instead of generating a
+            random one — see ``_peek_resume_run_id``. Passed through to
+            ``_open_bg_log_files`` so the bg log filenames, the
+            ``CONDUCTOR_RUN_ID`` env var, and the run-record poll key in
+            ``_finalize_background_launch`` all agree on one id.
 
     Returns:
         ``BackgroundLaunch`` describing the live launch.
@@ -806,7 +898,7 @@ def _spawn_bg_child(
     """
     try:
         run_id, stderr_path, stdout_path, stderr_handle, stdout_handle = _open_bg_log_files(
-            pid_workflow_ref, run_id=run_id
+            pid_workflow_ref, forced_run_id=forced_run_id
         )
     except OSError as exc:
         raise RuntimeError(f"Failed to create background log files: {exc}") from exc
@@ -829,14 +921,7 @@ def _spawn_bg_child(
                 f"Failed to start background process: {exc}. See child stderr log: {stderr_path}"
             ) from exc
 
-        workflow_started = _finalize_background_launch(
-            proc,
-            web_port,
-            pid_workflow_ref,
-            stderr_path,
-            run_id=run_id,
-            stdout_log=stdout_path,
-        )
+        workflow_started = _finalize_background_launch(proc, web_port, run_id, stderr_path)
     finally:
         # The child has its own duplicated OS handles by now (or never got
         # them, if Popen raised) — either way the parent's Python file
@@ -946,9 +1031,12 @@ def launch_background(
         "--no-interactive",
     ]
 
-    # Forward inputs
+    # Forward inputs -- via the hidden, strictly-typed --input-json flag
+    # (not --input's public, ambiguous heuristic), since these values are
+    # already declared-type-coerced and must round-trip verbatim (see
+    # ``_serialize_input_value``/``cli/run.py::coerce_typed_value``).
     for key, value in inputs.items():
-        cmd.extend(["--input", f"{key}={_serialize_value(value)}"])
+        cmd.extend(["--input-json", f"{key}={_serialize_input_value(value)}"])
 
     # Forward metadata
     if metadata:
@@ -977,69 +1065,62 @@ def launch_background(
     return _spawn_bg_child(cmd=cmd, web_port=web_port, pid_workflow_ref=workflow_path)
 
 
-def _checkpoint_run_id(workflow_path: Path | None, checkpoint_path: Path | None) -> str | None:
-    """Resolve the run id the resumed child will adopt from its checkpoint.
+def _peek_resume_run_id(workflow_path: Path | None, checkpoint_path: Path | None) -> str | None:
+    """Best-effort peek at the checkpoint the child will resume, to predict its ``run_id``.
 
-    Mirrors the checkpoint-resolution precedence in
-    ``cli/run.py::resume_workflow_async`` (explicit ``checkpoint_path`` first,
-    else the latest checkpoint for ``workflow_path``) so the launcher and the
-    child agree on which checkpoint is in play, and therefore on its
-    ``run_id``. That id is what ``EventLogSubscriber`` adopts via
-    ``existing_run_id`` whenever the original JSONL still exists, so using it
-    here too is what keeps the PID file, ``/api/info``, and the events log
-    agreeing with each other.
+    ``resume_workflow_async`` reuses the checkpoint's original ``run_id``
+    (rather than generating a fresh one, or honoring ``CONDUCTOR_RUN_ID``)
+    whenever the checkpoint's ``event_log_path`` still points at a real
+    file — see ``EventLogSubscriber.__init__``'s
+    ``existing_path``/``existing_run_id`` branch. The parent must mirror
+    that exact same decision so ``_finalize_background_launch`` polls
+    ``read_run_record`` for the id the child will actually write under
+    (D2); polling a freshly generated id here would time out and
+    terminate a perfectly healthy resumed run whenever the original log
+    file survived.
 
-    A launcher must never fail a launch over checkpoint parsing — the child
-    will surface the real error — so any failure here is swallowed and
-    ``None`` is returned, which falls back to a fresh id. The except clause
-    is deliberately broad (rather than naming only ``CheckpointManager``'s
-    documented exceptions) because a hand-edited or corrupted checkpoint can
-    fail in shapes ``CheckpointManager`` doesn't itself guard against — e.g.
-    a top-level JSON value that isn't an object (``AttributeError`` from
-    ``.get()``) or a ``run_id`` field that parsed as a non-string JSON value
-    (``AttributeError`` from ``.lower()`` below). Every such failure is
-    logged at warning level so the fallback leaves a forensic trail instead
-    of silently reusing a fresh id with no explanation (this module's own
-    stated philosophy — see the module docstring).
+    Best-effort: any failure to locate or parse the checkpoint returns
+    ``None`` (falling back to a freshly generated id, the pre-existing
+    behavior) rather than raising — the child's own checkpoint resolution
+    is authoritative and reports a real error if something is actually
+    wrong; this peek only affects which id the *parent* polls for.
 
     Args:
-        workflow_path: Optional workflow YAML path, used to find the latest
-            checkpoint when ``checkpoint_path`` is not given.
-        checkpoint_path: Optional explicit checkpoint path.
+        workflow_path: Optional workflow YAML path (mirrors the resume
+            command's positional arg).
+        checkpoint_path: Optional explicit checkpoint path (mirrors
+            ``--from``).
 
     Returns:
-        The checkpoint's ``run_id`` lowercased, when it is 8 hex chars
-        (matching ``BackgroundLaunch``'s invariant). ``None`` otherwise, or
-        when no checkpoint could be resolved/loaded.
+        The checkpoint's ``run_id`` if the child will reuse it (and it is
+        a valid fleet run id -- see
+        ``conductor.fleet.records.is_valid_run_id``, the same contract the
+        child's own ``write_run_record`` call enforces -- and hence also
+        satisfies ``BackgroundLaunch``'s invariant), else ``None``.
     """
     from conductor.engine.checkpoint import CheckpointManager
+    from conductor.fleet.records import is_valid_run_id
 
     try:
-        resolved_path = checkpoint_path
-        if resolved_path is None and workflow_path is not None:
-            resolved_path = CheckpointManager.find_latest_checkpoint(workflow_path)
-        if resolved_path is None:
+        if checkpoint_path is not None:
+            cp = CheckpointManager.load_checkpoint(checkpoint_path)
+        elif workflow_path is not None:
+            latest = CheckpointManager.find_latest_checkpoint(workflow_path)
+            if latest is None:
+                return None
+            cp = CheckpointManager.load_checkpoint(latest)
+        else:
             return None
-        cp = CheckpointManager.load_checkpoint(resolved_path)
-        # ``CheckpointData.run_id`` is a ``str`` type hint, not an enforced
-        # constraint — a hand-edited or malformed checkpoint could carry a
-        # non-string value here, which would otherwise raise a bare
-        # ``AttributeError`` from ``.lower()``.
-        candidate = str(cp.run_id or "").lower()
-    except Exception as exc:  # must never fail a launch over checkpoint parsing; see docstring
-        logger.warning(
-            "Could not adopt run_id from checkpoint %s (%s: %s); minting a "
-            "fresh id instead. If the resumed child adopts the checkpoint's "
-            "real run_id from its own events JSONL, the PID file may not "
-            "correlate with it.",
-            resolved_path,
-            type(exc).__name__,
-            exc,
-        )
+    except Exception:
         return None
 
-    if _RUN_ID_PATTERN_LOCAL.fullmatch(candidate):
-        return candidate
+    if not cp.run_id or not cp.event_log_path:
+        return None
+    if not is_valid_run_id(cp.run_id):
+        return None
+    candidate = Path(cp.event_log_path)
+    if candidate.exists() and candidate.is_file():
+        return cp.run_id
     return None
 
 
@@ -1064,12 +1145,6 @@ def launch_background_resume(
 
     Either ``workflow_path`` or ``checkpoint_path`` (or both) must be
     provided — at least one is required by the resume command.
-
-    The launch adopts the checkpoint's ``run_id`` (when it resolves to 8 hex
-    chars via :func:`_checkpoint_run_id`) instead of minting a fresh one, so
-    the PID file, ``/api/info``, the events JSONL, and the capture-log
-    filenames all agree on one id — matching what the resumed child's own
-    ``EventLogSubscriber`` adopts when the original JSONL still exists.
 
     Args:
         workflow_path: Optional path to the workflow YAML file. Used to find
@@ -1149,25 +1224,28 @@ def launch_background_resume(
         cmd.extend(["--log-file", str(log_file)])
 
     # Use workflow_path if available, otherwise fall back to checkpoint_path
-    # for the PID file name, log file naming, and recorded reference. The
-    # early guard at the top of this function already rejected the case
-    # where both are None; the ``or`` here picks the first non-None.
+    # for the bg log filename stem. The early guard at the top of this
+    # function already rejected the case where both are None; the ``or``
+    # here picks the first non-None.
     pid_workflow_ref: Path = workflow_path or checkpoint_path  # type: ignore[assignment]
 
-    # Adopt the checkpoint's run id (when resolvable) so the whole launch —
-    # PID file, bg capture-log filenames, ``CONDUCTOR_RUN_ID`` — agrees with
-    # the id the resumed child's ``EventLogSubscriber`` will itself adopt.
-    # Falls back to a fresh id via ``_spawn_bg_child``/``_open_bg_log_files``
-    # when the checkpoint has no usable id.
-    resumed_run_id = _checkpoint_run_id(workflow_path, checkpoint_path)
+    # Peek the checkpoint the child is about to resume so the parent polls
+    # for the *same* run_id the child will actually write its run record
+    # under (see ``_peek_resume_run_id``) — a resumed run whose original
+    # event log survived reuses that log's run_id rather than a freshly
+    # generated one, and generating our own here would poll the wrong key.
+    forced_run_id = _peek_resume_run_id(workflow_path, checkpoint_path)
 
     return _spawn_bg_child(
-        cmd=cmd, web_port=web_port, pid_workflow_ref=pid_workflow_ref, run_id=resumed_run_id
+        cmd=cmd,
+        web_port=web_port,
+        pid_workflow_ref=pid_workflow_ref,
+        forced_run_id=forced_run_id,
     )
 
 
 def _serialize_value(value: Any) -> str:
-    """Serialize a value for passing as a CLI --input argument.
+    """Serialize a value for passing as a CLI --metadata argument.
 
     Args:
         value: The value to serialize.
@@ -1177,4 +1255,33 @@ def _serialize_value(value: Any) -> str:
     """
     if isinstance(value, str):
         return value
+    return json.dumps(value)
+
+
+def _serialize_input_value(value: Any) -> str:
+    """Serialize an already-typed input value for the ``--input-json`` boundary.
+
+    Unlike :func:`_serialize_value`, this **always** JSON-encodes -- including
+    plain strings -- and is decoded on the other side by
+    ``cli/run.py::coerce_typed_value`` (a strict ``json.loads``) via the
+    hidden ``--input-json`` flag.
+
+    The pairing matters because values reaching here are already coerced to
+    their **declared** types (``fleet/launch.py::_coerce_input`` maps the
+    New Run form's fields onto the workflow's ``input:`` schema, returning a
+    ``string``-typed value verbatim), and nothing downstream restores that
+    typing: the engine's ``_apply_input_defaults`` only fills in *missing*
+    inputs, so whatever the child's CLI parse produces is final. Routing
+    these through the public ``--input`` flag instead would hand them to
+    ``coerce_value``, whose command-line heuristic re-guesses a bare
+    ``true``/``42``/``[1,2]`` into a bool/int/list -- silently discarding the
+    declared ``string`` type the form was careful to preserve.
+
+    Args:
+        value: The already-coerced value to serialize.
+
+    Returns:
+        A JSON-encoded string representation suitable for ``key=value`` CLI
+        format.
+    """
     return json.dumps(value)

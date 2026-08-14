@@ -1,10 +1,16 @@
-"""PID file utilities for tracking background workflow processes.
+"""Reader utilities for legacy port-keyed PID files.
 
-When ``conductor run --web-bg`` launches a detached child process, a PID file is
-written to ``~/.conductor/runs/`` so that ``conductor stop`` can discover and
-terminate it later.  The child process removes its own PID file on exit.
+Read-only. Conductor writes ``run_id``-keyed JSON run records
+(:mod:`conductor.fleet.records`) for every run, foreground and background
+alike. These readers exist so a background process started by a
+pre-Fleet-Manager build — which left a ``.pid`` file behind — stays
+discoverable and stoppable until it exits.
 
-PID files are JSON with the schema::
+This module also owns :func:`is_process_alive`, the repository's single
+listing-liveness probe; :mod:`conductor.fleet.records` reuses it rather than
+reimplementing the platform-specific process checks.
+
+Legacy PID files are JSON with the schema::
 
     {
         "pid": 12345,
@@ -16,11 +22,9 @@ PID files are JSON with the schema::
         "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log"
     }
 
-``run_id``, ``stderr_log``, and ``stdout_log`` are populated by
-``cli/bg_runner.py`` from the same launch that produced the PID file. A PID
-file written before this field existed has ``run_id`` present as an empty
-string (its prior default) and lacks the ``stderr_log``/``stdout_log`` keys
-entirely (they did not exist yet) — both shapes are read back as ``None``.
+``run_id`` may be present as an empty string, and
+``stderr_log``/``stdout_log`` may be absent entirely, depending on which
+build wrote the file — both shapes are read back as ``None``.
 """
 
 from __future__ import annotations
@@ -32,7 +36,6 @@ import os
 import sys
 import time
 from ctypes import wintypes
-from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -139,60 +142,11 @@ def pid_dir() -> Path:
     return rundir.runs_dir()
 
 
-def write_pid_file(
-    pid: int,
-    port: int,
-    workflow_path: str | Path,
-    run_id: str = "",
-    stderr_log: str = "",
-    stdout_log: str = "",
-) -> Path:
-    """Write a PID file for a background workflow process.
-
-    Args:
-        pid: Process ID of the background child.
-        port: TCP port the web dashboard is listening on.
-        workflow_path: Path to the workflow YAML file.
-        run_id: The run id shared with the child via ``CONDUCTOR_RUN_ID`` —
-            the key that finds the child's
-            ``conductor-<name>-<ts>-<run_id>.events.jsonl`` log.
-        stderr_log: Path to the file capturing the child's stderr — the
-            first place to look when a bg run misbehaves silently.
-        stdout_log: Path to the file capturing the child's stdout.
-
-    Returns:
-        Path to the created PID file.
-    """
-    workflow_name = Path(workflow_path).stem
-    filename = f"{workflow_name}-{port}.pid"
-    filepath = pid_dir() / filename
-
-    data = {
-        "pid": pid,
-        "port": port,
-        "workflow": str(workflow_path),
-        "started_at": datetime.now(UTC).isoformat(),
-        "run_id": run_id,
-        "stderr_log": stderr_log,
-        "stdout_log": stdout_log,
-    }
-
-    # Written atomically. ``write_text`` truncates and then streams, so a reader
-    # landing inside that window sees a partial file — and every reader here
-    # treats unparseable JSON as a dead run and unlinks it, which silently
-    # deregisters a live workflow. Rename is atomic on POSIX and on Windows for
-    # a same-directory replace, so a reader sees either the old file or the new
-    # one and never a half-written one. The temp name ends in ``.tmp`` so it is
-    # not picked up by the ``*.pid`` glob in :func:`read_pid_files`.
-    tmp = filepath.with_name(f"{filepath.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, filepath)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    logger.debug("Wrote PID file: %s", filepath)
-    return filepath
+# A --web-bg launch is gated on the child's own run record
+# (cli/bg_runner.py::_finalize_background_launch), so this module writes
+# nothing: a parent-side PID write would make two writers for one run. The
+# readers below are what keep a still-running pre-upgrade background process
+# discoverable.
 
 
 def scan_pid_files() -> list[dict]:
@@ -294,8 +248,9 @@ def remove_pid_file(port: int) -> bool:
         call, the original run can exit and a *new* run can bind the same port
         and write its own PID file — which this would then delete, orphaning a
         live workflow (issue #344). ``conductor stop`` uses
-        :func:`remove_pid_file_at` instead. This remains for compatibility with
-        any external caller.
+        :func:`remove_pid_file_for_pid` instead, which matches on port *and*
+        PID and delegates the unlink to :func:`remove_pid_file_at`. This
+        remains for compatibility with any external caller.
 
     Args:
         port: The web dashboard port to match.
@@ -359,6 +314,34 @@ def remove_pid_file_at(path: str | Path, expected_pid: int) -> bool:
     return True
 
 
+def remove_pid_file_for_pid(port: int, expected_pid: int) -> bool:
+    """Remove the legacy PID file for ``port``, but only if it describes ``expected_pid``.
+
+    The identity-checked counterpart to :func:`remove_pid_file`, for callers
+    that hold a full run record rather than a bare port. Port alone is not an
+    identity: between the caller's snapshot and this call the original run can
+    exit and a new run can bind the freed port, so a port-only match deletes
+    the *new* run's file and orphans a live workflow (issue #344). The unlink
+    itself is delegated to :func:`remove_pid_file_at`, which re-reads and
+    refuses loudly on a mismatch.
+
+    Args:
+        port: The web dashboard port to match.
+        expected_pid: The PID the caller believes owns that port.
+
+    Returns:
+        True if a matching PID file was found and removed, False otherwise.
+    """
+    for f in pid_dir().glob("*.pid"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("port") == port and data.get("pid") == expected_pid:
+            return remove_pid_file_at(f, expected_pid)
+    return False
+
+
 def remove_pid_file_for_current_process() -> bool:
     """Find and remove the PID file matching the current process.
 
@@ -383,13 +366,17 @@ def remove_pid_file_for_current_process() -> bool:
     return False
 
 
-def _is_process_alive(pid: int) -> bool:
+def is_process_alive(pid: int) -> bool:
     """Check whether a process with the given PID is still running.
 
     This is the *listing* probe: it answers "should this PID file be kept?"
     and deliberately errs towards True. Callers that are about to terminate
     something must use :func:`process_liveness` instead, which distinguishes
     "confirmed alive" from "probe failed" (see issue #344).
+
+    This is the codebase's single *listing* liveness probe (Fleet Manager
+    design's *The fix*); ``conductor.fleet.records`` reuses it rather than
+    reimplementing platform-specific process checks.
 
     Args:
         pid: The process ID to check.
@@ -403,6 +390,14 @@ def _is_process_alive(pid: int) -> bool:
     if sys.platform == "win32":
         return _is_process_alive_windows(pid)
     return _is_process_alive_posix(pid)
+
+
+# Kept as an alias, not a second implementation: `read_pid_files` and
+# `scan_pid_files` below call the private name, and `tests/test_cli/test_pid.py`
+# patches it. Note the two names are separate module attributes -- patching one
+# does not affect a caller that resolves the other, and `conductor.fleet.records`
+# resolves the public one.
+_is_process_alive = is_process_alive
 
 
 def process_liveness(pid: int) -> Liveness:
