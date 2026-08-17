@@ -7,7 +7,7 @@ workflow YAML configuration files.
 from __future__ import annotations
 
 import functools
-from typing import Any, Literal, get_args
+from typing import Annotated, Any, Literal, get_args
 from urllib.parse import urlparse
 
 import regex
@@ -16,6 +16,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StringConstraints,
     ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
@@ -1522,6 +1523,27 @@ class AgentDef(BaseModel):
     max_agent_iterations: 200 instead of using the default limit.
     """
 
+    session_key: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
+        None
+    )
+    """Continue one provider session across every execution sharing this key.
+
+    Keyed executions resume the same session instead of starting cold, so a
+    loop-back keeps what the agent already read and a later agent inherits an
+    earlier one's conversation. Default (``None``) starts a fresh session each
+    time; the map is checkpointed, so continuity survives ``conductor resume``.
+
+    A static label, never Jinja2-rendered — ``{{ ... }}`` is rejected (see
+    :meth:`validate_session_key_is_literal`). Requires a provider declaring
+    ``session_continuity`` (only ``claude-agent-sdk`` today); the validator
+    also rejects a key shared by concurrent executions.
+
+    Example YAML::
+
+        - name: analyze
+          session_key: investigation
+    """
+
     retry: RetryPolicy | None = None
     """Per-agent retry policy for transient failures.
 
@@ -1796,6 +1818,23 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("session_key")
+    @classmethod
+    def validate_session_key_is_literal(cls, v: str | None) -> str | None:
+        """Reject a Jinja2 template in ``session_key``.
+
+        The field is never rendered, so ``"item-{{ _key }}"`` would become one
+        literal key shared by every iteration rather than the per-item key the
+        author intended.
+        """
+        if v is not None and ("{{" in v or "{%" in v):
+            raise ValueError(
+                f"session_key {v!r} looks like a Jinja2 template, but session_key is "
+                f"never rendered — it would be used verbatim as a single literal key "
+                f"shared by every execution. Use a static label."
+            )
+        return v
+
     @field_validator("skills")
     @classmethod
     def validate_skills(cls, v: list[str] | None) -> list[str] | None:
@@ -1954,6 +1993,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
+            if self.session_key is not None:
+                raise ValueError("human_gate agents cannot have 'session_key'")
         elif self.type == "questions":
             if not self.questions and not self.source:
                 raise ValueError("questions agents require either 'questions' or 'source'")
@@ -2015,6 +2056,8 @@ class AgentDef(BaseModel):
                 raise ValueError("questions agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("questions agents cannot have 'working_dir'")
+            if self.session_key is not None:
+                raise ValueError("questions agents cannot have 'session_key'")
         elif self.type == "script":
             if not self.command:
                 raise ValueError("script agents require 'command'")
@@ -2034,6 +2077,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("script agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("script agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("script agents cannot have 'retry'")
             if self.input_mapping is not None:
@@ -2088,6 +2133,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("workflow agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("workflow agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("workflow agents cannot have 'retry'")
             if self.dialog is not None:
@@ -2143,6 +2190,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("wait agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("wait agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("wait agents cannot have 'retry'")
             if self.dialog is not None:
@@ -2214,6 +2263,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("set agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("set agents cannot have 'session_key'")
             if self.retry is not None:
                 raise ValueError("set agents cannot have 'retry'")
             if self.dialog is not None:
@@ -2282,6 +2333,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'max_session_seconds'")
             if self.max_agent_iterations is not None:
                 raise ValueError("terminate agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("terminate agents cannot have 'session_key'")
             if self.max_depth is not None:
                 raise ValueError("terminate agents cannot have 'max_depth'")
             if self.retry is not None:
@@ -3084,7 +3137,7 @@ class SkillInjectionConfig(BaseModel):
     have no progressive disclosure: :class:`~conductor.executor.agent.AgentExecutor`
     prepends every enabled skill's ``SKILL.md`` **plus its entire
     ``references/`` tree** to the rendered prompt, on every agent call and
-    every retry. The bundled ``conductor`` skill alone is ~117KB (~29K
+    every retry. The bundled ``conductor`` skill alone is ~132KB (~33K
     tokens), so an unbounded list is easy to turn into most of a context
     window by accident.
 
@@ -3096,7 +3149,7 @@ class SkillInjectionConfig(BaseModel):
         runtime:
             skill_injection:
                 warn_bytes: 65536     # warn above 64KB
-                max_bytes: 131072     # fail above 128KB
+                max_bytes: 163840     # fail above 160KB
     """
 
     # Frozen for the reason ``ProviderSettings`` documents: this model carries a
@@ -3109,16 +3162,22 @@ class SkillInjectionConfig(BaseModel):
     """Log a warning when injected skill content exceeds this many bytes.
 
     ``None`` disables the warning. The 64KB default is below the bundled
-    ``conductor`` skill's ~117KB so that combination is surfaced rather
+    ``conductor`` skill's ~132KB so that combination is surfaced rather
     than passing silently.
     """
 
-    max_bytes: int | None = Field(default=128 * 1024, ge=0)
+    max_bytes: int | None = Field(default=160 * 1024, ge=0)
     """Fail the agent when injected skill content exceeds this many bytes.
 
-    ``None`` disables the limit. The 128KB default is above the bundled
-    ``conductor`` skill's ~117KB, so enabling it does not break an
+    ``None`` disables the limit. The 160KB default is above the bundled
+    ``conductor`` skill's ~132KB, so enabling it does not break an
     existing single-skill workflow — it catches accumulation.
+
+    Raised from 128KB once the bundled skill grew past it: the ceiling was
+    chosen when that skill was ~117KB, and two independent documentation
+    additions carried it over. A default that the shipped skill fails is
+    not a limit, it is a broken workflow, so it tracks the skill with
+    headroom rather than pinning a number the content has outgrown.
     """
 
     @model_validator(mode="after")

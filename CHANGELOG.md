@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.32...HEAD)
 
+### Added
+
+- **Session continuity for the `claude-agent-sdk` provider via a per-agent
+  `session_key`** — executions tagged with the same key now continue one
+  Claude session instead of each starting cold, so an investigate → check →
+  retry loop keeps what it already read, and a later agent can inherit an
+  earlier one's conversation by declaring the same key. The key is a static,
+  unrendered label; sessions are scoped per working directory, since that is
+  how the `claude` CLI stores transcripts. The map is persisted in
+  checkpoints, so continuity survives `conductor resume`, and the new
+  `session_continuity` capability turns `session_key` against a provider that
+  cannot honor it into a `conductor validate` error rather than a silently
+  dropped setting. A session the provider cannot confirm on disk logs a
+  warning and starts fresh rather than failing the run, and `conductor
+  validate` refuses a key shared across concurrent executions. See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#session-continuity-session_key)
+  and
+  [`examples/claude-agent-sdk-session-key.yaml`](examples/claude-agent-sdk-session-key.yaml).
+- **Checkpoints now persist every active provider's session map**, rather than
+  stopping at the first provider that exposes one. A workflow mixing providers
+  previously kept only one map, silently dropping the others' sessions
+  depending on which agent happened to run first. `claude-agent-sdk`
+  namespaces its own entries, so they cannot collide with Copilot's
+  agent-name keys in the merged map.
+
+### Changed
+
+- **`runtime.skill_injection.max_bytes` now defaults to 160KB, up from
+  128KB.** The bundled `conductor` skill has grown to ~132KB, so the old
+  ceiling no longer sat above it: a `claude` or `hermes` agent enabling the
+  shipped skill would have failed outright instead of warning, which is the
+  opposite of what the two defaults are for. The 64KB `warn_bytes` default is
+  unchanged, so that combination still warns. Workflows that set `max_bytes`
+  explicitly are unaffected.
+
 ## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
 
 ### Fixed

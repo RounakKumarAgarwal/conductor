@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -47,6 +48,23 @@ except ImportError:
     query: Any = None
     ClaudeAgentOptions: Any = None
     AgentDefinition: Any = None
+
+try:
+    # Separate try from the required symbols above so a missing lookup helper
+    # degrades the session_key transcript guard rather than disabling the whole
+    # provider. Not a version floor: every supported build (0.2.82 -> 0.2.134)
+    # exports both, and one import statement binds both or neither. The
+    # reachable failure is upstream moving ``project_key_for_directory``, which
+    # is re-exported from ``_internal.session_store`` — hence the one-time
+    # warning in ``__init__`` (see :func:`_warn_if_session_lookup_unavailable`),
+    # without which continuity would silently never resume again.
+    from claude_agent_sdk import (  # ty: ignore[unresolved-import]
+        get_session_info,
+        project_key_for_directory,
+    )
+except ImportError:  # pragma: no cover - both symbols exist at our >=0.2.82 floor
+    get_session_info: Any = None
+    project_key_for_directory: Any = None
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +248,42 @@ _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 # ``MCPServerDef.tools``. Any other value is a narrowing filter the SDK has no
 # way to express — see :func:`_translate_mcp_servers`.
 _ALL_TOOLS: Final[str] = "*"
+
+# Prefix for our entries in the checkpoint session map, a flat dict shared by
+# every provider — see :meth:`ClaudeAgentSdkProvider.get_session_ids`.
+_SESSION_KEY_NAMESPACE: Final[str] = "claude-agent-sdk:"
+
+# Message types whose ``session_id`` is the conversation's own. Hook and other
+# auxiliary frames carry unrelated ids — see the capture site in ``execute``.
+_SESSION_ID_MESSAGES: Final[frozenset[str]] = frozenset({"AssistantMessage", "ResultMessage"})
+
+# One warning per process, not per provider construction — see
+# :func:`_warn_if_session_lookup_unavailable`.
+_SESSION_LOOKUP_WARNED = False
+
+
+def _warn_if_session_lookup_unavailable() -> None:
+    """Warn once when the SDK stops exporting the session-lookup symbols.
+
+    Without them :meth:`ClaudeAgentSdkProvider._resolve_resume_session` can
+    never verify a transcript, so it returns ``None`` on every call and each
+    keyed execution silently starts a fresh session — the exact outcome
+    ``session_key`` exists to prevent. A ``logger.debug`` there does not reach
+    anyone: Conductor installs no logging handlers, so DEBUG is never printed.
+    Warned at construction rather than per execution so a broken build is
+    reported once, before the first agent runs.
+    """
+    global _SESSION_LOOKUP_WARNED
+    if _SESSION_LOOKUP_WARNED:
+        return
+    _SESSION_LOOKUP_WARNED = True
+    logger.warning(
+        "The installed claude-agent-sdk does not export get_session_info / "
+        "project_key_for_directory, so a session's transcript cannot be verified "
+        "before resuming it. Agents declaring 'session_key' will start a fresh "
+        "session on every execution instead of continuing one. Reinstall or pin "
+        "'claude-agent-sdk>=0.2.82'."
+    )
 
 
 def _translate_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
@@ -556,14 +610,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``max_session_seconds`` is enforced between messages via
         # ``time.monotonic()``.
         max_session_seconds=True,
-        # The SDK manages its own session state inside the ``claude`` CLI;
-        # Conductor does not persist or replay it through resume.
+        # False even though a ``session_key`` agent's session *is* restored on
+        # resume: this flag is a blanket promise the startup banner reads out,
+        # and agents without a key — the default — carry nothing across.
+        # ``session_continuity`` below is the granular, honest claim.
         checkpoint_resume=False,
-        # Token counts come from ``ResultMessage.usage`` (cumulative
-        # session total — see A4 fix).
+        # Token counts come from ``ResultMessage.usage``, which reports the
+        # tokens of the execution that produced it — a resumed session bills
+        # only its own turns, so continuity does not inflate later usage rows.
         usage_tracking=True,
-        # No global mutable state shared across calls — the SDK spawns
-        # an independent subprocess per query() invocation.
+        # Each call spawns an independent subprocess, and the ``session_key``
+        # map is a plain dict mutated only from the event loop. Two executions
+        # resuming one key concurrently is the unsafe case; ``conductor
+        # validate`` rejects it statically, and the in-flight guard in
+        # ``execute`` refuses it at run time — which is where a keyed agent
+        # inside a concurrently fanned-out sub-workflow gets caught, since the
+        # static check cannot see through a ``type: workflow`` step.
         concurrent_safe=True,
         # The engine-resolved working directory is forwarded to
         # ``ClaudeAgentOptions.cwd``, which the SDK applies as the ``claude``
@@ -583,6 +645,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``ClaudeAgentOptions.agents``, MCP through the same temp-file
         # config the workflow's own servers use.
         plugins=True,
+        # ``session_key`` is honored: executions sharing a key resume one
+        # Claude session, and the map is persisted across ``conductor resume``.
+        session_continuity=True,
         upstream_pin="claude-agent-sdk>=0.2.82",
         maintainer="@lesandiz (best-effort)",
     )
@@ -607,6 +672,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # constructed lazily, so an untranslatable server config surfaces when
         # the first agent on this provider runs — not at `conductor validate`.
         self._mcp_servers = _translate_mcp_servers(mcp_servers) if mcp_servers else {}
+        # Claude session ids keyed by ``(session_key, cwd)`` — by the authored
+        # key rather than agent name, since sharing a session between agents is
+        # the point, and by cwd because the CLI stores transcripts per working
+        # directory, so one key under two directories is two sessions.
+        self._session_ids: dict[tuple[str, str], str] = {}
+        self._resume_session_ids: dict[tuple[str, str], str] = {}
+        # Slots currently executing, so a second execution cannot resume a
+        # session the first still has open — see :meth:`_claim_session_slot`.
+        self._in_flight_sessions: set[tuple[str, str]] = set()
+        if get_session_info is None or project_key_for_directory is None:
+            _warn_if_session_lookup_unavailable()
 
     @property
     def supports_native_skills(self) -> bool:
@@ -660,6 +736,126 @@ class ClaudeAgentSdkProvider(AgentProvider):
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
     ) -> AgentOutput:
+        """Run one agent, holding its ``session_key`` slot for the duration.
+
+        A thin wrapper around :meth:`_execute_session` so the in-flight claim
+        has a ``finally`` that covers *every* exit path, including the
+        interrupt return and a ``ValidationError`` raised while assembling the
+        output. ``context`` is unused — the executor renders the prompt before
+        it reaches any provider. The SDK-availability check lives in
+        :meth:`_execute_session`, alongside the symbols it guards.
+        """
+        # Resolved before anything else so the session slot is known: the slot
+        # is ``(session_key, cwd)``, and a claim taken later would leave the
+        # window it exists to close.
+        resolved_cwd = self._resolve_session_cwd(agent)
+        session_key = agent.session_key
+        if session_key is None:
+            return await self._execute_session(
+                agent=agent,
+                resolved_cwd=resolved_cwd,
+                rendered_prompt=rendered_prompt,
+                tools=tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_directories,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+            )
+
+        slot = (session_key, resolved_cwd)
+        self._claim_session_slot(agent, slot)
+        try:
+            return await self._execute_session(
+                agent=agent,
+                resolved_cwd=resolved_cwd,
+                rendered_prompt=rendered_prompt,
+                tools=tools,
+                interrupt_signal=interrupt_signal,
+                event_callback=event_callback,
+                skill_directories=skill_directories,
+                custom_agents=custom_agents,
+                extra_mcp_servers=extra_mcp_servers,
+            )
+        finally:
+            self._in_flight_sessions.discard(slot)
+
+    def _resolve_session_cwd(self, agent: AgentDef) -> str:
+        """Resolve the working directory this execution runs in.
+
+        ``os.getcwd()`` raises ``OSError`` when the process cwd has been
+        deleted or an ancestor lost traversal permission. Handled here rather
+        than by :meth:`_execute_session`'s generic arm, which would report a
+        vanished cwd as a CLI installation problem and hand back a bare
+        pathless errno.
+
+        Raises:
+            ProviderError: If no ``working_dir`` is declared and the process
+                working directory cannot be read.
+        """
+        try:
+            return agent.working_dir or os.getcwd()
+        except OSError as exc:
+            raise ProviderError(
+                f"Agent '{agent.name}' declares no working_dir and the process working "
+                f"directory could not be resolved: {exc}",
+                suggestion=(
+                    "The directory conductor was launched from has been deleted or is "
+                    "no longer readable. Re-run from an existing directory, or set an "
+                    "explicit working_dir on the agent or runtime."
+                ),
+                is_retryable=False,
+            ) from exc
+
+    def _claim_session_slot(self, agent: AgentDef, slot: tuple[str, str]) -> None:
+        """Reserve ``(session_key, cwd)`` for this execution, or refuse.
+
+        Two executions resuming one session leave the first orphaned and two
+        ``claude`` processes appending to a single transcript.
+        ``conductor validate`` rejects the statically visible shapes (two
+        parallel members sharing a key, a keyed for-each agent with
+        ``max_concurrent > 1``), but it cannot see through a ``type: workflow``
+        step: a sub-workflow inherits the parent's ``ProviderRegistry`` — and
+        so this very instance — so a concurrent for-each over a sub-workflow
+        whose inner agent is keyed reaches here with the slot already taken.
+        A ``workflow`` agent cannot itself carry a ``session_key``, so the
+        static check never fires for it.
+
+        Raises:
+            ProviderError: If the slot is already held by a running execution.
+        """
+        if slot in self._in_flight_sessions:
+            session_key, cwd = slot
+            raise ProviderError(
+                f"Agent '{agent.name}' declares session_key={session_key!r} under "
+                f"working directory {cwd!r}, but another execution holding that key "
+                f"is still running. Two executions cannot resume one Claude session: "
+                f"the second would orphan the first and both would append to a "
+                f"single transcript.",
+                suggestion=(
+                    "Give the concurrent executions distinct session_key values, run "
+                    "them under different working_dir values, or serialise them "
+                    "(set 'max_concurrent: 1' on the for_each, or move one agent out "
+                    "of the parallel group). A sub-workflow shares its parent's "
+                    "provider, so a keyed agent inside a 'type: workflow' step "
+                    "counts as concurrent too."
+                ),
+                is_retryable=False,
+            )
+        self._in_flight_sessions.add(slot)
+
+    async def _execute_session(
+        self,
+        agent: AgentDef,
+        resolved_cwd: str,
+        rendered_prompt: str,
+        tools: list[str] | None = None,
+        interrupt_signal: asyncio.Event | None = None,
+        event_callback: EventCallback | None = None,
+        skill_directories: list[str] | None = None,
+        custom_agents: list[dict[str, Any]] | None = None,
+        extra_mcp_servers: dict[str, Any] | None = None,
+    ) -> AgentOutput:
         if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 
@@ -704,28 +900,19 @@ class ClaudeAgentSdkProvider(AgentProvider):
             agents_enabled=bool(custom_agents),
         )
 
-        # ``os.getcwd()`` raises ``OSError`` when the process cwd has been
-        # deleted or an ancestor lost traversal permission. Resolve it here
-        # with a dedicated handler rather than leaning on the generic arm
-        # below, which would report a vanished cwd as a CLI installation
-        # problem and hand back a bare pathless errno.
-        try:
-            resolved_cwd = agent.working_dir or os.getcwd()
-        except OSError as exc:
-            raise ProviderError(
-                f"Agent '{agent.name}' declares no working_dir and the process working "
-                f"directory could not be resolved: {exc}",
-                suggestion=(
-                    "The directory conductor was launched from has been deleted or is "
-                    "no longer readable. Re-run from an existing directory, or set an "
-                    "explicit working_dir on the agent or runtime."
-                ),
-                is_retryable=False,
-            ) from exc
+        session_key = agent.session_key
+        resume_session_id = (
+            await self._resolve_resume_session(session_key, resolved_cwd) if session_key else None
+        )
 
         options = ClaudeAgentOptions(
             model=model,
             system_prompt=agent.system_prompt,
+            resume=resume_session_id,
+            # Explicit though it matches the SDK default: forking would mint a
+            # new session id and a new transcript on every execution, so the
+            # key would chase a moving id and leave one-turn transcripts behind.
+            fork_session=False,
             # Already resolved by ``WorkflowEngine._resolve_agent_working_dir``
             # (agent over runtime, rendered, absolutized, existence-checked),
             # so pass it through verbatim rather than re-resolving — that would
@@ -827,6 +1014,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
             agen = query(prompt=rendered_prompt, options=options)
             async for message in agen:
+                # Record before the interrupt and timeout checks below, which
+                # return: an agent cut short is worth resuming. Only
+                # conversation messages are trusted — hook and other auxiliary
+                # frames carry session ids of their own, and recording one
+                # would shadow the real session with a transcript-less id.
+                if session_key and type(message).__name__ in _SESSION_ID_MESSAGES:
+                    message_session_id = getattr(message, "session_id", None)
+                    if message_session_id:
+                        self._session_ids[(session_key, resolved_cwd)] = message_session_id
+
                 if interrupt_signal is not None and interrupt_signal.is_set():
                     return self._build_output(
                         content_parts,
@@ -931,10 +1128,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
                         structured_output = msg.structured_output
                     elif getattr(msg, "result", None) and not content_parts:
                         content_parts.append(msg.result)
-                    # ``ResultMessage.usage`` is the CUMULATIVE session total
-                    # (per the SDK docstring on ApiUsage.apiUsage). Replace
-                    # rather than add — the per-AssistantMessage running sum
-                    # exists only as a fallback when no ResultMessage arrives
+                    # ``ResultMessage.usage`` totals THIS execution — measured
+                    # against the live CLI, a resumed session reports only the
+                    # turns it just ran, not the whole transcript. (The
+                    # "cumulative session" wording on ``ApiUsage.apiUsage``
+                    # describes a context-window TypedDict, not this field.)
+                    # Replace rather than add: it already covers every
+                    # AssistantMessage in the call, whose running sum exists
+                    # only as a fallback for when no ResultMessage arrives
                     # (e.g. mid-stream interrupt).
                     if hasattr(msg, "usage") and msg.usage:
                         # The three prompt figures are one snapshot: replace
@@ -1070,6 +1271,154 @@ class ClaudeAgentSdkProvider(AgentProvider):
 
     async def close(self) -> None:
         pass
+
+    def get_session_ids(self) -> dict[str, str]:
+        """Return the Claude session id recorded for each session.
+
+        Mirrors the Copilot hook of the same name; the engine calls it
+        (duck-typed) when writing a checkpoint. Keys are namespaced and carry
+        their cwd because the engine merges every provider's map into one flat
+        field, and our authored keys collide with Copilot's agent names —
+        ``session_key: investigate`` on an agent named ``investigate``.
+
+        Restored entries are re-exported alongside ones recorded this run, so a
+        checkpoint taken before the keyed agent runs again does not drop them.
+
+        Returns:
+            Mapping of namespaced ``[session_key, cwd]`` to Claude session id.
+        """
+        merged = {**self._resume_session_ids, **self._session_ids}
+        return {
+            f"{_SESSION_KEY_NAMESPACE}{json.dumps([key, cwd])}": sid
+            for (key, cwd), sid in merged.items()
+        }
+
+    def set_resume_session_ids(self, ids: dict[str, str]) -> None:
+        """Seed session ids restored from a checkpoint.
+
+        Entries that are not ours — another provider's, or malformed — are
+        skipped rather than raising: one unreadable slice of a shared field
+        must not fail the whole restore.
+
+        Args:
+            ids: Merged provider session map from the checkpoint, as written
+                by :meth:`get_session_ids`.
+        """
+        restored: dict[tuple[str, str], str] = {}
+        for raw_key, sid in ids.items():
+            if not raw_key.startswith(_SESSION_KEY_NAMESPACE):
+                continue
+            try:
+                parsed = json.loads(raw_key.removeprefix(_SESSION_KEY_NAMESPACE))
+            except (ValueError, TypeError):
+                logger.debug("Ignoring unreadable session map entry %r", raw_key)
+                continue
+            # Shape-checked before unpacking, not after: valid JSON with the
+            # wrong shape either raises (``[["x"],["y"]]`` is unhashable) or
+            # silently stores a key nothing can ever match — ``[1, 2]`` keeps
+            # ints, ``"ab"`` unpacks two characters, ``{"a": 1, "b": 2}``
+            # unpacks dict keys — and each of those then re-exports cleanly
+            # from :meth:`get_session_ids` into every later checkpoint.
+            if not (
+                isinstance(parsed, list)
+                and len(parsed) == 2
+                and all(isinstance(part, str) for part in parsed)
+            ):
+                logger.debug("Ignoring malformed session map entry %r", raw_key)
+                continue
+            key, cwd = parsed
+            restored[(key, cwd)] = sid
+        self._resume_session_ids = restored
+
+    async def _resolve_resume_session(self, session_key: str, cwd: str) -> str | None:
+        """Return the session id to resume for ``session_key``, if usable.
+
+        A session recorded this run takes precedence over one restored from a
+        checkpoint. The id is returned only once its transcript is confirmed
+        present: ``--resume`` for a session the CLI cannot find aborts it
+        *before running the agent*, so an ordinary first iteration or a pruned
+        transcript would otherwise become a hard failure.
+
+        Args:
+            session_key: The agent's workflow-authored session key.
+            cwd: Resolved working directory for this execution.
+
+        Returns:
+            A resumable session id, or ``None`` to start a fresh session.
+        """
+        session_id = self._session_ids.get((session_key, cwd)) or self._resume_session_ids.get(
+            (session_key, cwd)
+        )
+        if session_id is None:
+            return None
+        if get_session_info is None and project_key_for_directory is None:
+            # The SDK stopped exporting both lookup symbols (warned about once
+            # at construction). Never hand the id over unverified — a fresh
+            # session is the safer degradation.
+            logger.debug(
+                "Session lookup unavailable in this claude-agent-sdk build; "
+                "starting a fresh session for session_key '%s'.",
+                session_key,
+            )
+            return None
+
+        # Off the event loop: on a miss ``get_session_info`` falls through to
+        # a `git worktree list` subprocess (5s timeout), which would otherwise
+        # stall every concurrently running agent.
+        if not await asyncio.to_thread(self._session_transcript_exists, session_id, cwd):
+            logger.warning(
+                "Claude session %s for session_key '%s' could not be found under %s "
+                "(the CLI prunes transcripts on its own schedule); starting a fresh session.",
+                session_id,
+                session_key,
+                cwd,
+            )
+            return None
+
+        logger.info(
+            "Resuming Claude session %s for session_key '%s' under %s.",
+            session_id,
+            session_key,
+            cwd,
+        )
+        return session_id
+
+    @staticmethod
+    def _session_transcript_exists(session_id: str, cwd: str) -> bool:
+        """Report whether ``session_id`` has a transcript resumable from ``cwd``.
+
+        Checks the exact on-disk path the CLI uses,
+        ``<config>/projects/<project key for cwd>/<id>.jsonl``, rather than
+        trusting ``get_session_info``, which derives a *summary* and returns
+        ``None`` when it cannot, so a resumable session can look absent. It
+        also resolves through sibling git worktrees and a global project scan,
+        which is wider than the ``(session_key, cwd)`` scoping we promise
+        authors, so its answer is accepted only when the ``cwd`` it recorded
+        matches ours. It is still consulted as a fallback, since it tolerates
+        a hash mismatch for very long paths the exact check cannot model.
+        """
+        try:
+            if project_key_for_directory is not None:
+                config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+                projects = Path(unicodedata.normalize("NFC", config_dir)) / "projects"
+                transcript = projects / project_key_for_directory(cwd) / f"{session_id}.jsonl"
+                if transcript.is_file():
+                    return True
+
+            if get_session_info is None:
+                return False
+            info = get_session_info(session_id, directory=cwd)
+            if info is None:
+                return False
+            recorded_cwd = getattr(info, "cwd", None)
+            if recorded_cwd is None:
+                return False
+            return os.path.realpath(recorded_cwd) == os.path.realpath(cwd)
+        except Exception:
+            # A lookup that errors must not take the run down; the caller
+            # simply starts a fresh session.
+            logger.debug("Session lookup failed for %s under %s", session_id, cwd, exc_info=True)
+            return False
 
     @staticmethod
     def _resolve_tool_config(

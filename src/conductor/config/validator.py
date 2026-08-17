@@ -1747,6 +1747,36 @@ def _resolved_provider_name(agent: AgentDef, default: str) -> str:
     return agent.provider or default
 
 
+def _references_loop_variable(template: str, loop_var: str) -> bool:
+    """Whether ``template`` actually reads a for-each loop variable.
+
+    Parsed rather than substring-matched, because both halves of a substring
+    scan are wrong in opposite directions. ``_index`` and ``_key`` occur inside
+    ordinary path segments — ``/var/lib/search_index``, ``/srv/api_key`` — so a
+    bare scan reports per-item variation that is not there; and a literal
+    ``{{ item`` scan matches only the spacings it enumerates, missing
+    ``{{- item }}`` while still matching an unrelated expression that merely
+    mentions the name, such as ``{{ workflow.input.api_key }}``.
+
+    Args:
+        template: The raw (unrendered) string to inspect.
+        loop_var: The group's ``as:`` name, e.g. ``item``.
+
+    Returns:
+        True when the template reads ``loop_var``, ``_index`` or ``_key``.
+    """
+    if "{{" not in template and "{%" not in template:
+        return False
+    try:
+        undeclared = meta.find_undeclared_variables(_JINJA_ENV.parse(template))
+    except (jinja2.TemplateSyntaxError, jinja2.TemplateAssertionError):
+        # A template that will not parse cannot be shown to vary per item, and
+        # this feeds a safety check — so report "no", the conservative answer.
+        # The malformed template itself is reported elsewhere, at render time.
+        return False
+    return bool(undeclared & {loop_var, "_index", "_key"})
+
+
 def _validate_provider_capabilities(
     config: WorkflowConfig,
     workflow_path: Path | None = None,
@@ -2345,6 +2375,16 @@ def _validate_provider_capabilities(
                 f"directories (capabilities.working_dir=False)."
             )
 
+        # session_key: a provider that ignores it starts a fresh session every
+        # execution, silently discarding the context the author asked to keep.
+        if agent.session_key is not None and not caps.session_continuity:
+            errors.append(
+                f"Agent '{agent.name}' sets session_key={agent.session_key!r} but "
+                f"provider '{provider_name}' does not support session continuity "
+                f"(capabilities.session_continuity=False). Remove the session_key, "
+                f"or override the agent to a provider that supports it."
+            )
+
         # skills: a provider that cannot surface skill content would drop it
         # silently — the agent still runs, just without the knowledge the
         # author asked for. An empty list is an explicit opt-out, so only a
@@ -2530,6 +2570,53 @@ def _validate_provider_capabilities(
                 f"uses provider '{member_provider}' (capabilities.concurrent_safe=False). "
                 f"This provider is not safe to run in parallel."
             )
+
+    # ----- Concurrent executions must not share a session -----
+    # Two executions resuming one session leaves two CLI processes appending to
+    # one transcript. Sessions are scoped to (session_key, working directory),
+    # so different directories are already distinct sessions and are not
+    # flagged — that is what makes multi-worktree fan-out legal.
+    # ``runtime_working_dir`` is bound at the top of this function.
+
+    def _effective_working_dir(agent: AgentDef) -> str | None:
+        return agent.working_dir or runtime_working_dir
+
+    for pg in config.parallel:
+        # (session_key, effective working_dir) -> first agent claiming it
+        claimed: dict[tuple[str, str | None], str] = {}
+        for member_name in pg.agents:
+            member = agent_by_name.get(member_name)
+            if member is None or member.session_key is None:
+                continue
+            slot = (member.session_key, _effective_working_dir(member))
+            first = claimed.get(slot)
+            if first is not None:
+                errors.append(
+                    f"Parallel group '{pg.name}' runs agents '{first}' and "
+                    f"'{member_name}' concurrently, but both declare "
+                    f"session_key: '{member.session_key}' with the same working "
+                    f"directory. Concurrent executions cannot share a session — "
+                    f"give them distinct keys, run them under different "
+                    f"working_dir values, or move one out of the group."
+                )
+            else:
+                claimed[slot] = member_name
+
+    for fe in config.for_each:
+        if fe.max_concurrent <= 1 or fe.agent.session_key is None:
+            continue
+        # A per-item working_dir gives each iteration its own session, so only
+        # a directory shared by every iteration is unsafe.
+        working_dir = _effective_working_dir(fe.agent) or ""
+        if _references_loop_variable(working_dir, fe.as_):
+            continue
+        errors.append(
+            f"For-each group '{fe.name}' has max_concurrent={fe.max_concurrent} "
+            f"and declares session_key: '{fe.agent.session_key}' without a "
+            f"per-item working_dir. Every iteration would resume one session "
+            f"concurrently — set max_concurrent: 1, remove the session_key, or "
+            f"give each item its own working_dir."
+        )
 
     for fe in config.for_each:
         # A serial for_each (max_concurrent == 1) does not actually run

@@ -189,6 +189,14 @@ class ProviderCapabilities(BaseModel):
     against a provider with ``plugins=False`` fail validation. Defaults
     to ``False``."""
 
+    session_continuity: bool = False
+    """``True`` when the provider honors an agent's ``session_key``, reusing
+    one provider session across every execution tagged with that key.
+
+    Agents that set ``session_key:`` against a provider with
+    ``session_continuity=False`` fail validation, rather than silently losing
+    the context the author asked to keep. Defaults to ``False``."""
+
     upstream_pin: str | None = None
     """Upstream package pin surfaced in the experimental banner, e.g.
     ``"claude-agent-sdk>=0.1.0"``. ``None`` for providers that have no
@@ -261,6 +269,8 @@ class ProviderCapabilities(BaseModel):
             items.append("working_dir ignored")
         if not self.skills:
             items.append("no skills support")
+        if not self.session_continuity:
+            items.append("no session_key continuity")
         return items
 
 

@@ -398,6 +398,74 @@ Because paths are normalized lexically instead of resolving to their real paths:
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
 > On the `claude-agent-sdk` provider the directory is also a trust boundary in the other direction: the `claude` CLI loads `CLAUDE.md` and `.claude/settings*.json` (including hooks) from wherever it runs, so pointing `working_dir` at an untrusted checkout means running that checkout's instructions.
 
+### Session Continuity (`session_key`)
+
+By default each agent execution starts a fresh provider session, so an agent
+that runs twice re-reads everything it read the first time. The optional
+per-agent `session_key` opts into continuity: every execution tagged with the
+same key continues **one** underlying session. Only the `claude-agent-sdk`
+provider supports it today.
+
+```yaml
+agents:
+  - name: investigate
+    session_key: investigation     # loop-backs continue this session
+    prompt: Investigate the failing build...
+    routes:
+      - to: verify
+
+  - name: verify
+    type: script
+    command: ./verify.sh
+    routes:
+      - to: investigate            # second pass keeps the earlier context
+        when: "{{ verify.output.exit_code != 0 }}"
+      - to: summarize
+
+  - name: summarize
+    session_key: investigation     # different agent, same session
+    prompt: Summarise what you found.
+```
+
+- **A static label, never rendered.** Unlike `working_dir` or `model`,
+  `session_key` is not a Jinja2 template. A `{{ ... }}` value is rejected at
+  validation, rather than becoming one literal key shared by every execution.
+  Whitespace is stripped and the result must be non-empty. The provider maps
+  the label to the real session id internally, so no session id passes through
+  the workflow context. Two agents share a session by writing the same string.
+- **The prompt is still rendered and sent every time.** The session only means
+  the model *additionally* has the prior conversation, so it sees
+  `[earlier turns] + [freshly rendered prompt]`. Omit `session_key` where an
+  agent is meant to re-evaluate from scratch.
+- **Scoped to one working directory.** The `claude` CLI stores transcripts per
+  directory, so Conductor tracks sessions by `(session_key, working
+  directory)`. Two agents sharing a key under different `working_dir` values
+  get two independent sessions. Keep `working_dir` stable across executions
+  meant to continue each other.
+- **Survives `conductor resume`.** The session map is written to the checkpoint
+  and restored on resume. The engine merges every active provider's map, and
+  `claude-agent-sdk` namespaces its own entries (`claude-agent-sdk:["<key>",
+  "<cwd>"]`) and ignores entries that are not its own.
+- **Degrades, never fails the run.** `--resume` for a session the CLI cannot
+  find makes it abort *before running the agent*. The provider therefore
+  resumes only after it confirms the transcript is on disk. If a recorded
+  session has since disappeared — the CLI prunes transcripts on its own
+  schedule — the provider logs a warning and starts fresh. Having nothing
+  recorded for a key is normal and is not logged: that is the first execution
+  under it, or one under a different `working_dir`.
+- **Rejected step types:** `script`, `human_gate`, `questions`, `workflow`,
+  `wait`, `set`, and `terminate` — none have a provider session to continue.
+  `session_key` is also rejected against a provider that does not declare the
+  `session_continuity` capability, rather than being dropped at runtime.
+- **Concurrent executions cannot share a key.** `conductor validate` rejects two
+  members of one parallel group with the same key, and a for-each agent with a
+  `session_key` and `max_concurrent > 1`. The second execution would resume a
+  session the first still has open, leaving two `claude` processes appending to
+  one transcript. Give them distinct keys, drop the key, or set
+  `max_concurrent: 1`.
+
+See [`examples/claude-agent-sdk-session-key.yaml`](../examples/claude-agent-sdk-session-key.yaml).
+
 ### Sandbox Configuration (ACA)
 
 The optional per-agent `sandbox:` block overrides settings for the
@@ -661,9 +729,9 @@ are skipped, and `outcome` is `skipped_remaining`.
   compete for one terminal and one dashboard prompt slot, the same reason gates
   are refused). Route to a `questions` step from the group's `routes:` instead.
 - Cannot set `options`, `model`, `provider`, `tools`, `output`, `dialog`,
-  `validator`, `reasoning`, `skills`, `context_tier`, `input_mapping`,
-  `sandbox`, `max_depth`, `timeout_seconds`, `output_mode`, or `working_dir` —
-  no provider is invoked. Note `timeout_seconds` in particular: there is no
+  `validator`, `reasoning`, `skills`, `plugins`, `context_tier`,
+  `input_mapping`, `sandbox`, `max_depth`, `timeout_seconds`, `session_key`,
+  `output_mode`, or `working_dir` — no provider is invoked. Note `timeout_seconds` in particular: there is no
   bound on how long a human may take.
 - `abort_route` requires `allow_abort: true`.
 
@@ -863,7 +931,7 @@ agents:
 
 **Iteration counting** — wait steps count toward `workflow.limits.max_iterations` (each pause is one step). They are not subject to `max_agent_iterations`, which counts per-LLM-agent tool iterations.
 
-**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
+**Restrictions** — wait steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, or `output`. Wait steps also cannot be used inside `parallel` groups or `for_each` groups.
 
 See [`examples/wait-step.yaml`](../examples/wait-step.yaml) for a complete polling workflow.
 ### Set Steps
@@ -949,7 +1017,7 @@ Per-key typing on multi `values:` is not supported.
 
 **Composition** — set steps are allowed inside `parallel` groups (each member publishes its bound value to context) and as the inline agent of a `for_each` group (one bound value per item). Inside a parallel group, set templates cannot reference sibling group members (the validator catches this at config time, since the engine renders against a pre-group snapshot).
 
-**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, or `max_agent_iterations`. They count toward `limits.max_iterations` like any other step.
+**Restrictions** — set agents cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. They count toward `limits.max_iterations` like any other step.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
@@ -1089,7 +1157,7 @@ agents:
 
 **Final output** — when `output_template:` is set, it *replaces* the workflow-level `output:` mapping for this termination path. Each rendered value is passed through the same JSON-coercion helper used elsewhere in the engine, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals are parsed. When `output_template:` is omitted, the workflow-level `output:` is rendered as on any other terminal path.
 
-**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
 
 **Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
 
@@ -1784,7 +1852,7 @@ Two consequences worth knowing:
   `conductor validate` reports a path skill that is not, rather than letting
   it fail mid-run. The same skill works on `copilot` untouched.
 * **Eager injection is expensive.** The bundled `conductor` skill alone is
-  ~117KB (~29K tokens), prepended to *every* call and every retry.
+  ~132KB (~33K tokens), prepended to *every* call and every retry.
 
 ### Limiting eager injection
 
@@ -1796,7 +1864,7 @@ workflow:
   runtime:
     skill_injection:
       warn_bytes: 65536      # Default: 65536 (64KB). null disables the warning.
-      max_bytes: 131072      # Default: 131072 (128KB). null disables the limit.
+      max_bytes: 163840      # Default: 163840 (160KB). null disables the limit.
 ```
 
 Exceeding `warn_bytes` logs a warning and reports it from `conductor

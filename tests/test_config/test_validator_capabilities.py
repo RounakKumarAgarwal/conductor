@@ -1726,3 +1726,275 @@ class TestAcaSkillsRealCapabilities:
         )
         with pytest.raises(ConfigurationError, match="runtime.skills"):
             validate_workflow_config(config)
+
+
+class TestSessionContinuityCrossCheck:
+    """Requirement: ``session_key`` against a provider declaring
+    ``session_continuity=False`` is a hard validate error — the provider would
+    otherwise start a fresh session every execution, silently discarding the
+    context the author asked to carry across loop-backs."""
+
+    def test_session_key_against_unsupported_provider_errors(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", session_key="investigation")],
+        )
+        with pytest.raises(ConfigurationError, match="does not support session continuity"):
+            validate_workflow_config(config)
+
+    def test_session_key_against_supported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
+        config = _build_workflow(
+            agents=[AgentDef(name="a", prompt="hi", session_key="investigation")],
+        )
+        validate_workflow_config(config)
+
+    def test_omitted_against_unsupported_provider_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        config = _build_workflow(agents=[AgentDef(name="a", prompt="hi")])
+        validate_workflow_config(config)
+
+    def test_for_each_inline_agent_is_checked_too(self, patch_caps: Any) -> None:
+        """Inline agents inherit the workflow provider and must not escape the gate."""
+        patch_caps({"copilot": _caps(session_continuity=False)})
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="investigation")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=1,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="does not support session continuity"):
+            validate_workflow_config(config)
+
+
+class TestSharedSessionKeyConcurrency:
+    """Concurrent executions must not resume the same session.
+
+    Two ``claude`` processes resuming one session orphan the first and
+    append to a single transcript concurrently, so this is caught statically
+    rather than left to the author.
+    """
+
+    def test_parallel_members_sharing_a_key_error(self) -> None:
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="shared"),
+                AgentDef(name="b", prompt="hi", session_key="shared"),
+                AgentDef(name="entry", prompt="hi"),
+            ],
+            parallel=[ParallelGroup(name="entry", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "entry"
+        with pytest.raises(ConfigurationError, match="Concurrent executions cannot share"):
+            validate_workflow_config(config)
+
+    def test_parallel_members_with_distinct_keys_pass(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="alpha"),
+                AgentDef(name="b", prompt="hi", session_key="beta"),
+            ],
+            parallel=[ParallelGroup(name="grp", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "grp"
+        validate_workflow_config(config)
+
+    def test_parallel_members_sharing_a_key_under_different_cwds_pass(
+        self, patch_caps: Any
+    ) -> None:
+        """Sessions are scoped to (key, working directory).
+
+        These two provably cannot share a session, so rejecting them would
+        block the multi-worktree fan-out that the cwd scoping exists for.
+        """
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        config = _build_workflow(
+            agents=[
+                AgentDef(name="a", prompt="hi", session_key="shared", working_dir="/tmp"),
+                AgentDef(name="b", prompt="hi", session_key="shared", working_dir="/usr"),
+            ],
+            parallel=[ParallelGroup(name="grp", agents=["a", "b"])],
+        )
+        config.workflow.entry_point = "grp"
+        validate_workflow_config(config)
+
+    def test_concurrent_for_each_with_a_per_item_working_dir_passes(self, patch_caps: Any) -> None:
+        """A per-item directory gives each iteration its own session."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/repos/{{ item }}",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)
+
+    def test_concurrent_for_each_with_a_key_errors(self) -> None:
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
+            validate_workflow_config(config)
+
+    def test_serial_for_each_with_a_key_passes(self, patch_caps: Any) -> None:
+        patch_caps({"copilot": _caps(session_continuity=True)})
+        inline = AgentDef(name="inner", prompt="{{ item }}", session_key="shared")
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=1,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)
+
+    @pytest.mark.parametrize(
+        ("working_dir", "per_item"),
+        [
+            ("/var/lib/search_index", False),
+            ("/srv/api_key", False),
+            ("/srv/{{ workflow.input.api_key }}", False),
+            ("/tmp/{{- item }}", True),
+        ],
+        ids=[
+            "index-in-a-path-segment",
+            "key-in-a-path-segment",
+            "unrelated-expression",
+            "trim-marker",
+        ],
+    )
+    def test_per_item_working_dir_is_detected_by_parsing_not_substring(
+        self, patch_caps: Any, working_dir: str, per_item: bool
+    ) -> None:
+        """The exemption must turn on the template actually reading the loop
+        variable.
+
+        A substring scan was wrong in both directions: ``_index`` and ``_key``
+        occur inside ordinary path segments, and an unrelated expression that
+        merely mentions ``api_key`` matched, so three shared directories were
+        waved through; while ``{{- item }}`` — a spacing the scan did not
+        enumerate — was rejected despite being genuinely per-item.
+        """
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir=working_dir,
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+
+        if per_item:
+            validate_workflow_config(config)
+        else:
+            with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
+                validate_workflow_config(config)
+
+    def test_an_unparseable_working_dir_is_treated_as_shared(self, patch_caps: Any) -> None:
+        """A template that will not parse cannot be shown to vary per item, so
+        the safety check keeps its refusal rather than guessing."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/tmp/{{ item",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        with pytest.raises(ConfigurationError, match="without a per-item working_dir"):
+            validate_workflow_config(config)
+
+    def test_a_loop_index_reference_exempts_the_group(self, patch_caps: Any) -> None:
+        """``_index`` and ``_key`` count as per-item, but only when read as
+        variables rather than spelled inside a directory name."""
+        patch_caps({"copilot": _caps(session_continuity=True, working_dir=True)})
+        inline = AgentDef(
+            name="inner",
+            prompt="{{ item }}",
+            session_key="shared",
+            working_dir="/tmp/run-{{ _index }}",
+        )
+        config = _build_workflow(
+            agents=[AgentDef(name="entry", prompt="hi")],
+            for_each=[
+                ForEachDef(
+                    name="loop",
+                    type="for_each",
+                    source="entry.output.items",
+                    **{"as": "item"},
+                    agent=inline,
+                    max_concurrent=4,
+                )
+            ],
+        )
+        config.workflow.entry_point = "loop"
+        validate_workflow_config(config)

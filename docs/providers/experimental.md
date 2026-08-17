@@ -51,6 +51,7 @@ validator so the operator can plan accordingly.
 | `max_session_seconds` | Provider does not enforce a wall-clock session timeout. Agents that set `max_session_seconds` fail validation. |
 | `checkpoint_resume` | Provider session state does not survive `conductor resume` (re-runs the agent from scratch). |
 | `working_dir` | Provider does not apply the resolved working directory to its session/subprocess cwd. Workflows that set `working_dir` against this provider fail validation. |
+| `session_continuity` | Provider does not honor a per-agent `session_key`; every execution starts a fresh session. Agents that set `session_key` fail validation. |
 
 ## Non-negotiable rules
 
@@ -99,7 +100,7 @@ adopting one does not inflate the install surface for others.
 
 | Provider | Upstream pin | Maintainer | Capability carve-outs |
 |---|---|---|---|
-| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume`. Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is pinned empty as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited. |
+| `claude-agent-sdk` | `claude-agent-sdk>=0.2.82` | `@lesandiz (best-effort)` | no `workflow_tools_passthrough`, no `reasoning_effort`, `prompt_injection` structured output, no `checkpoint_resume` (agents without a `session_key` carry no session state across a resume). Supports `mcp_tools` as of [#335](https://github.com/microsoft/conductor/issues/335), except that a narrowing per-server `tools:` filter is refused (no SDK equivalent). Supports `working_dir` as of [#348](https://github.com/microsoft/conductor/issues/348); the CLI would load `CLAUDE.md` and `.claude/settings*.json` from that directory, but `setting_sources` is pinned empty as of [#352](https://github.com/microsoft/conductor/issues/352) so ambient instructions, settings, hooks, and skills are not inherited. Declares `session_continuity`: an agent with a `session_key` reuses one Claude session across executions, and the session map survives `conductor resume` — see [Session Continuity](../workflow-syntax.md#session-continuity-session_key). |
 | `hermes` | `hermes-agent` | `(community contribution)` | no `mcp_tools`, `prompt_injection` structured output, no `working_dir` |
 | `aca` | `azure-identity>=1.19.0` | `(unassigned)` | no `workflow_tools_passthrough` (the wrapped in-container `CopilotProvider` never applies the `tools:` allowlist to the SDK session), no `working_dir` (only the separate, container-relative `sandbox.working_dir` is honored — not the generic host-resolved field), `prompt_injection` structured output (inherits the inner Copilot provider), no `checkpoint_resume` (ephemeral sandbox sessions, no volume mount). Declares `interrupt`/`max_session_seconds` as `True`, but the shipped runner MVP doesn't fully back either yet — see [Known Gaps](./aca.md#known-gaps-runner-mvp). |
 
