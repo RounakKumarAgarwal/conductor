@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depending on which agent happened to run first. `claude-agent-sdk`
   namespaces its own entries, so they cannot collide with Copilot's
   agent-name keys in the merged map.
+- **Fleet Manager TUI: RDP session detection turns animation off
+  automatically** (issue #462). An RDP session (`SESSIONNAME` starting
+  `RDP-Tcp`) now disables the ~10fps animation clock by default — the same
+  repaint that made the TUI feel laggy over that transport. SSH is
+  deliberately *not* detected: it ships the ANSI byte stream for the local
+  terminal to render (a few hundred bytes per frame), where RDP renders
+  remotely and ships changed pixel regions, so only the latter is costly in
+  practice. `CONDUCTOR_FLEET_NO_ANIM` remains the remedy for a genuinely
+  slow SSH link and for transports with no reliable signal (VNC, Citrix,
+  xrdp). The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch still
+  wins over detection, and a new `CONDUCTOR_FLEET_ANIM` force-on switch
+  overrides detection when the operator knows the link can take it. Any path
+  that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or detection —
+  now also sets Textual's own `App.animation_level` to `none`, which
+  additionally stops Textual's built-in widget animations (e.g. the tables'
+  smooth-scroll easing); this is a behavior change for existing
+  `CONDUCTOR_FLEET_NO_ANIM` users, not only for the new detection path. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 
 ### Changed
 
@@ -63,6 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fleet Manager TUI: the ~10fps animation tick no longer repaints the
+  preview pane and footer** (issue #462). `RunsScreen._tick` used to end by
+  calling `_update_gate_detail()`, rebuilding the whole preview `Text` and
+  re-evaluating the footer's key bindings ten times a second for the sake of
+  one spinner glyph — over RDP this made the whole TUI feel laggy. The
+  preview pane is now split into `#run-preview` (the gate section and
+  progress header, rebuilt on data/selection changes only) and
+  `#run-preview-score` (the flowed step chips, the only part that actually
+  animates); the frame tick now only repaints the latter, alongside the
+  animated table cells it already updated. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 - **`claude` provider: `validate_connection()` no longer fails startup when an
   Anthropic-compatible endpoint doesn't implement `models.list()`** (issue
   #455). Azure AI Foundry's Anthropic endpoint, and some LiteLLM/Databricks AI
