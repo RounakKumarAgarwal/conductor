@@ -197,10 +197,23 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `h` | History |
 | `q` | Quit |
 
-On Run detail, `enter` opens the highlighted step; that screen binds `r`
-to reload and `tab` to switch panes. On History, `enter` surfaces the
-`conductor replay` command for the highlighted row and `r` resumes it in
-the background when a checkpoint is available (see [above](#screens)).
+Screens with a row-scoped `enter` advertise it in their own footer:
+
+| Screen | `enter` |
+|--------|---------|
+| Runs | Open run detail for the selected row |
+| Run detail | Open step detail for the highlighted step |
+| History | Surface `conductor replay <log>` for the selected row |
+| Providers | Expand/collapse the highlighted provider |
+| Registries | Open that registry's workflows |
+| Registry workflows | Open that workflow's inputs |
+
+On Providers, `enter` is not offered while a model/status sub-row is
+highlighted — only a provider row itself can be expanded or collapsed.
+The Step-detail screen that `enter` opens from Run detail binds `r` to
+reload and `tab` to switch panes. On History, `r` resumes the
+highlighted row's checkpoint in the background when a checkpoint is
+available (see [above](#screens)).
 
 Inside the Registries drill-down, `n` runs the highlighted (or currently
 displayed) workflow rather than starting from an empty form. A launch

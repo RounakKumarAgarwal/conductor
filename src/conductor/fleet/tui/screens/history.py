@@ -55,6 +55,7 @@ from typing import TYPE_CHECKING, cast
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, Static
 
@@ -64,6 +65,7 @@ from conductor.fleet.launch import LaunchError, launch_resume
 from conductor.fleet.resume import ResumableCheckpoint, correlate_checkpoints
 from conductor.fleet.tui.actions import report_background_launch
 from conductor.fleet.tui.theme import loading_text, status_label
+from conductor.fleet.tui.widgets import highlighted_row_key
 
 if TYPE_CHECKING:
     # The app module imports this screen module, so a top-level import of
@@ -138,7 +140,15 @@ def _format_cost(entry: HistoryEntry) -> str:
 class HistoryScreen(Screen):
     """Completed-run history, bounded by retention (E14)."""
 
-    BINDINGS = [("escape", "back", "Back"), ("r", "resume", "Resume")]
+    BINDINGS = [
+        # Row-scoped -- surfaces the replay command for the highlighted row.
+        # `priority` is required or `DataTable`'s hidden `enter` shadows it
+        # in the footer; same reasoning as `runs.py`'s `BINDINGS` comment,
+        # issue #459.
+        Binding("enter", "show_replay_command", "Replay cmd", priority=True),
+        ("r", "resume", "Resume"),
+        ("escape", "back", "Back"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -280,6 +290,11 @@ class HistoryScreen(Screen):
                 continue
             displayed[key] = entry
         self._displayed_entries = displayed
+        # The row set just changed shape (a load can go from zero rows to
+        # many, or vice versa on a rebuild), so the footer's `enter` label
+        # needs to be re-evaluated the same way a cursor move would --
+        # this screen has no poll timer, so nothing else would trigger it.
+        self.refresh_bindings()
 
     def _add_row(self, table: DataTable, entry: HistoryEntry, key: str) -> None:
         """Add one history entry's row: workflow, outcome, duration, tokens, cost."""
@@ -296,7 +311,7 @@ class HistoryScreen(Screen):
         )
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Offer ``conductor replay <log>`` for the selected row (E14-T3).
+        """Offer ``conductor replay <log>`` for the selected row (mouse click).
 
         Depth is delegated for viewing: this never opens a replay
         dashboard itself -- it surfaces the exact command via a
@@ -316,6 +331,40 @@ class HistoryScreen(Screen):
         key = event.row_key.value
         if key is None:
             return
+        self._notify_replay_for(key)
+
+    def action_show_replay_command(self) -> None:
+        """Surface the replay command for the highlighted row -- the
+        ``enter`` binding (E14-T3).
+
+        This is a ``priority`` binding, so it runs *ahead* of ``DataTable``'s
+        own hidden ``enter`` (``select_cursor``) and the keypress never
+        becomes a ``RowSelected`` message. Mouse clicks still arrive that way
+        and land in :meth:`on_data_table_row_selected`; both funnel through
+        :meth:`_notify_replay_for`, so keyboard and mouse each take exactly
+        one path and ``enter`` cannot notify twice.
+        """
+        key = self._selected_history_key()
+        if key is None:
+            return
+        self._notify_replay_for(key)
+
+    def _selected_history_key(self) -> str | None:
+        """Return the DataTable row key behind the currently highlighted row.
+
+        ``None`` when the table is empty or the cursor's row key can't be
+        resolved -- mirrors ``runs.py``'s ``_selected_key``.
+        """
+        return highlighted_row_key(self.query_one(DataTable))
+
+    def _notify_replay_for(self, key: str) -> None:
+        """Notify the replay command for ``key``, if it still resolves.
+
+        Depth is delegated, not re-implemented: this never opens a replay
+        dashboard itself -- it surfaces the exact command via a
+        notification so the operator can run it in a terminal (per the
+        design's *Division of labor*, TUI = breadth).
+        """
         entry = self._displayed_entries.get(key)
         if entry is None:
             return
@@ -329,12 +378,12 @@ class HistoryScreen(Screen):
         self.notify(message, markup=False)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Refresh the footer as the cursor moves (issue #460).
+        """Refresh the footer as the cursor moves (issues #459, #460).
 
-        Without this, ``check_action``'s ``resume`` gate keeps reporting
-        whichever row was selected when the footer was last built -- the
-        exact reason ``runs.py::_refresh_row_bindings`` exists for its own
-        row-scoped bindings.
+        Without this, ``check_action``'s ``show_replay_command``/``resume``
+        gates keep reporting whichever row was selected when the footer was
+        last built -- the exact reason ``runs.py::_refresh_row_bindings``
+        exists for its own row-scoped bindings.
         """
         self.refresh_bindings()
 
@@ -367,17 +416,21 @@ class HistoryScreen(Screen):
         return self._resumable.get(entry.path)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """Hide ``r``/Resume when the highlighted row has no checkpoint
-        (issue #460).
+        """Hide ``show_replay_command`` while no row is selected (e.g. an
+        empty or still-loading table), and hide ``r``/Resume when the
+        highlighted row has no checkpoint (issue #460), so the footer
+        never advertises a key that does nothing.
 
         Mirrors ``runs.py::check_action``'s ``g``/Gate reasoning: a key that
         can't currently do anything is hidden from the footer outright
-        rather than shown disabled. Gating is checkpoint-driven only --
-        never ``outcome`` -- so this returns ``True`` for a ``completed`` row
-        with a correlated checkpoint exactly as it would for an ``unknown``
-        or ``failed`` one (see ``conductor.fleet.resume``'s module
-        docstring for why).
+        rather than shown disabled. Resume gating is checkpoint-driven
+        only -- never ``outcome`` -- so this returns ``True`` for a
+        ``completed`` row with a correlated checkpoint exactly as it would
+        for an ``unknown`` or ``failed`` one (see ``conductor.fleet.resume``'s
+        module docstring for why).
         """
+        if action == "show_replay_command":
+            return self._selected_history_key() is not None
         if action == "resume":
             return self._resume_target() is not None
         return True
