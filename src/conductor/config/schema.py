@@ -594,19 +594,6 @@ class CostConfig(BaseModel):
     """Custom pricing overrides for specific models."""
 
 
-class HooksConfig(BaseModel):
-    """Lifecycle hooks for workflow events."""
-
-    on_start: str | None = None
-    """Expression evaluated when workflow starts."""
-
-    on_complete: str | None = None
-    """Expression evaluated when workflow completes successfully."""
-
-    on_error: str | None = None
-    """Expression evaluated when workflow fails."""
-
-
 class RetryPolicy(BaseModel):
     """Per-agent retry policy for transient failure resilience.
 
@@ -3622,9 +3609,6 @@ class WorkflowDef(BaseModel):
 
     cost: CostConfig = Field(default_factory=CostConfig)
     """Cost tracking configuration."""
-
-    hooks: HooksConfig | None = None
-    """Lifecycle event hooks."""
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).

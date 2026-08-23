@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
 
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
+
+### Removed
+
+- **Dead workflow lifecycle hooks (`on_start` / `on_complete` / `on_error`)**
+  (#476). The `hooks:` block was parsed and its templates rendered, but the
+  result was discarded — never emitted as an event, logged, shown, stored, or
+  used for any side effect — so the feature was entirely unobservable,
+  including when a hook failed. `HooksConfig`, `WorkflowDef.hooks`, the engine's
+  `_execute_hook` / `LifecycleHookResult` and all call sites, and the Hooks
+  section of `docs/workflow-syntax.md` have been removed. A workflow that still
+  declares `hooks:` now fails validation with a clear error rather than
+  silently ignoring the block. Lifecycle hooks may return later, but the right
+  syntax will be designed against a concrete requirement (emitting an event,
+  invoking a `type: script` step, or calling a webhook) rather than rendering a
+  template and throwing it away.
+
 ### Fixed
 
 - **MCP tool discovery and structured tool results no longer break with MCP
