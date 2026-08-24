@@ -187,7 +187,18 @@ class IdleRecoveryConfig:
 
     Attributes:
         idle_timeout_seconds: Time without any SDK events before considering session idle.
+            Settable via ``runtime.idle_timeout_seconds`` in workflow YAML (Copilot only).
+            The clock is suppressed entirely while a tool call is in flight (#488). The
+            SDK does not guarantee any events during a tool call — ``tool.execution_progress``
+            and ``tool.execution_partial_result`` exist in the SDK schema but are opt-in
+            per tool, so for most tool calls nothing arrives between
+            ``tool.execution_start`` and ``tool.execution_complete``. A stale clock in
+            that window therefore means the tool is still running, not that the session
+            is stuck. ``max_session_seconds`` is the sole backstop for a genuinely
+            wedged tool.
         max_recovery_attempts: Maximum number of "continue" messages to send before failing.
+            Settable via ``runtime.max_idle_recovery_attempts`` in workflow YAML
+            (Copilot only).
         max_session_seconds: Hard wall-clock limit on total session duration. Prevents
             sessions from hanging indefinitely even if non-idle events keep flowing.
         recovery_prompt: Template for the recovery message sent to stuck sessions.
@@ -202,6 +213,26 @@ class IdleRecoveryConfig:
         "Your last activity was: {last_activity}. "
         "Please continue with your task from where you left off."
     )
+
+    def __post_init__(self) -> None:
+        """Validate fields on direct construction.
+
+        The Pydantic bounds on the corresponding ``runtime.*`` schema fields
+        only guard the YAML path; ``CopilotProvider(idle_recovery_config=...)``
+        is a documented, directly-constructible path (used throughout the
+        test suite) that bypasses them entirely. Without this, an invalid
+        value like ``idle_timeout_seconds=0`` turns the new
+        tool-in-flight-suppression branch into an unbounded busy-wait for
+        the full ``max_session_seconds``.
+        """
+        if self.idle_timeout_seconds <= 0:
+            raise ValueError(f"idle_timeout_seconds must be > 0, got {self.idle_timeout_seconds}")
+        if self.max_recovery_attempts < 0:
+            raise ValueError(
+                f"max_recovery_attempts must be >= 0, got {self.max_recovery_attempts}"
+            )
+        if self.max_session_seconds <= 0:
+            raise ValueError(f"max_session_seconds must be > 0, got {self.max_session_seconds}")
 
 
 @dataclass
@@ -305,6 +336,9 @@ class CopilotProvider(AgentProvider):
         # ``mcp_servers`` for MCP. The SDK's ``plugin_directories`` is
         # deliberately unused — see conductor.plugins for why.
         plugins=True,
+        # ``runtime.idle_timeout_seconds`` / ``runtime.max_idle_recovery_attempts``
+        # tune the IdleRecoveryConfig-backed watchdog (#488).
+        idle_recovery=True,
         max_temperature=1.0,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
@@ -441,6 +475,12 @@ class CopilotProvider(AgentProvider):
         self._provider_settings = provider_settings
         self._tool_output_config = tool_output or ToolOutputConfig()
         self._github_token = github_token
+        # Warn-once latch for extended idle-recovery suppression while a
+        # tool call is in flight (#488) — mirrors the
+        # `_pricing_hook_failed_warned` / `_context_window_anomaly_warned`
+        # pattern in engine/workflow.py: "a debug-only record would never
+        # reach an operator."
+        self._tool_suppression_warned = False
         self._warn_custom_routing_default_model()
 
     @staticmethod
@@ -1635,6 +1675,13 @@ class CopilotProvider(AgentProvider):
         # Mutable container for tool iteration counting
         tool_iteration_ref: list[int] = [0]
 
+        # In-flight tool calls, keyed by tool_call_id (falling back to the
+        # tool name when no id is available). A non-empty dict here means a
+        # tool is genuinely still running, not that the session is stuck
+        # (#488) — see IdleRecoveryConfig.idle_timeout_seconds docstring for
+        # why a stale clock isn't reliable here.
+        active_tools: dict[str, str] = {}
+
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
             event_type = event.type.value if hasattr(event.type, "value") else str(event.type)
@@ -1716,6 +1763,35 @@ class CopilotProvider(AgentProvider):
                 last_activity_ref[1] = tool_name
                 # Count tool-use iterations
                 tool_iteration_ref[0] += 1
+                # Record the in-flight call so idle detection can tell "the
+                # tool is still running" from "the session is stuck" (#488).
+                # tool_call_id is a required field on real SDK events, but
+                # tests exercise this with Mock objects where getattr always
+                # succeeds without returning a string — guard with isinstance
+                # rather than trusting the attribute is present and usable.
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else str(tool_name)
+                active_tools[key] = str(tool_name)
+            elif event_type == "tool.execution_complete":
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else None
+                if key is not None and key in active_tools:
+                    active_tools.pop(key, None)
+                elif isinstance(tool_call_id, str):
+                    # Unrecognized tool_call_id (duplicate or unmatched
+                    # completion event — this SDK re-delivers events, see
+                    # seen_call_ids above). Do NOT guess which in-flight
+                    # entry to evict: popping the wrong one would re-arm the
+                    # idle watchdog while a different tool is still running,
+                    # reproducing #488. Leaving a stale entry is safe because
+                    # max_session_seconds backstops it.
+                    logger.debug(
+                        "tool.execution_complete for untracked tool_call_id %r — "
+                        "ignoring; in-flight: %s",
+                        tool_call_id,
+                        sorted(active_tools),
+                    )
+                last_activity_ref[1] = next(iter(active_tools.values()), None)
 
             # Forward structured events upstream via event_callback
             if event_callback is not None:
@@ -1748,6 +1824,7 @@ class CopilotProvider(AgentProvider):
             max_agent_iterations=max_agent_iterations,
             interrupt_signal=interrupt_signal,
             agent_name=agent_name,
+            active_tools_ref=active_tools,
         )
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
@@ -2182,6 +2259,7 @@ class CopilotProvider(AgentProvider):
         elif last_event_type:
             activity_map = {
                 "tool.execution_start": "starting a tool call",
+                "tool.execution_complete": "finishing a tool call",
                 "assistant.reasoning": "reasoning about the problem",
                 "assistant.turn_start": "beginning a response",
                 "assistant.message": "sending a message",
@@ -2252,6 +2330,47 @@ class CopilotProvider(AgentProvider):
 
         console.print(text)
 
+    def _log_tool_suppression_warning(
+        self,
+        in_flight_tools: str,
+        elapsed: float,
+        max_session: float,
+        agent_name: str | None = None,
+    ) -> None:
+        """Log the first occurrence of idle-recovery suppression to the console.
+
+        Mirrors ``_log_recovery_attempt``'s console output, but distinct from
+        it: this fires once per provider lifetime (see
+        ``_tool_suppression_warned``) rather than per recovery attempt, since
+        a genuinely long tool call can suppress idle recovery for many idle
+        windows in a row and a repeated console line would just be noise.
+
+        Args:
+            in_flight_tools: Comma-joined names of the currently in-flight tools.
+            elapsed: Seconds the session has been running so far.
+            max_session: The wall-clock session limit that still applies.
+            agent_name: Optional agent identifier for attribution.
+        """
+        from rich.text import Text
+
+        from conductor.console import make_console
+
+        console = make_console(stderr=True, highlight=False)
+
+        text = Text()
+        text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
+        text.append("⚠️ ", style="yellow")
+        text.append("Idle recovery suppressed", style="yellow bold")
+        text.append(
+            f" - tool(s) in flight: '{in_flight_tools}', running {elapsed:.0f}s, "
+            f"will hard-fail at max_session_seconds={max_session:.0f}s",
+            style="dim italic",
+        )
+
+        console.print(text)
+
     async def _wait_with_idle_detection(
         self,
         done: asyncio.Event,
@@ -2264,6 +2383,7 @@ class CopilotProvider(AgentProvider):
         max_agent_iterations: int | None = None,
         interrupt_signal: asyncio.Event | None = None,
         agent_name: str | None = None,
+        active_tools_ref: dict[str, str] | None = None,
     ) -> bool:
         """Wait for session completion with idle detection, recovery, and optional interrupt.
 
@@ -2271,8 +2391,12 @@ class CopilotProvider(AgentProvider):
         with interrupt support (aborting on user request). When the model is
         actively working (SDK events flowing), the idle timer continuously
         resets — so stuck-detection is suppressed while the model is actively
-        working. The interrupt signal, however, is always raced regardless of
-        activity.
+        working. It is also suppressed while any tool call is in flight
+        (``active_tools_ref`` non-empty): a stale idle clock during a
+        long-running tool call means the tool is still running, not that the
+        session is stuck (#488; see ``IdleRecoveryConfig.idle_timeout_seconds``
+        docstring for why events can't be relied on during a tool call). The
+        interrupt signal, however, is always raced regardless of activity.
 
         Args:
             done: Event that signals session completion.
@@ -2292,6 +2416,11 @@ class CopilotProvider(AgentProvider):
                 logging so that idle-recovery messages emitted from concurrent
                 for-each or parallel iterations can be attributed to a specific
                 agent. ``None`` means no attribution tag.
+            active_tools_ref: Mutable dict of in-flight tool calls (id -> tool
+                name). A non-empty dict suppresses idle recovery entirely
+                (see ``IdleRecoveryConfig.idle_timeout_seconds`` docstring).
+                ``None`` (the default) preserves the pre-#488 behaviour of
+                every existing caller.
 
         Returns:
             True if interrupted, False if completed normally.
@@ -2392,6 +2521,51 @@ class CopilotProvider(AgentProvider):
                     return False  # Completed successfully
 
             except TimeoutError as e:
+                # Timeout fired — but check if a tool call is still in
+                # flight first. The SDK does not guarantee any events during
+                # a tool call — tool.execution_progress and
+                # tool.execution_partial_result exist in the schema but are
+                # opt-in per tool, so for most tool calls nothing arrives
+                # between start and complete (see IdleRecoveryConfig
+                # docstring). A stale idle clock here therefore means the
+                # tool is still running (#488), not that the session is
+                # stuck. max_session_seconds (checked at the top of this
+                # loop) is the sole backstop for a genuinely wedged tool —
+                # max_agent_iterations cannot help, since its counter only
+                # advances on a new tool.execution_start and is frozen for
+                # the entire duration of a wedge.
+                if active_tools_ref:
+                    logger.debug(
+                        "Idle timeout reached while tool(s) in flight%s: %s — suppressing "
+                        "idle recovery",
+                        f" agent={agent_name}" if agent_name else "",
+                        ", ".join(active_tools_ref.values()),
+                    )
+                    if not self._tool_suppression_warned:
+                        self._tool_suppression_warned = True
+                        logger.warning(
+                            "Idle recovery suppressed while tool(s) in flight%s: %s. "
+                            "Suppression has been in effect for %.0fs; if the tool(s) "
+                            "are genuinely stuck, the session will hard-fail once "
+                            "max_session_seconds (%.0fs) is exceeded. Further "
+                            "occurrences are logged at debug level.",
+                            f" agent={agent_name}" if agent_name else "",
+                            ", ".join(active_tools_ref.values()),
+                            elapsed,
+                            max_session,
+                        )
+                        if verbose_enabled:
+                            self._log_tool_suppression_warning(
+                                in_flight_tools=", ".join(active_tools_ref.values()),
+                                elapsed=elapsed,
+                                max_session=max_session,
+                                agent_name=agent_name,
+                            )
+                    recovery_attempts = 0
+                    if not done.is_set():
+                        done.clear()
+                    continue
+
                 # Timeout fired — but check if events were recently received.
                 # The agent may be actively working (tool calls, reasoning) without
                 # having reached session.idle yet. Only consider it stuck if no
