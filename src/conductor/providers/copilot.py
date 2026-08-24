@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -141,6 +142,39 @@ class RetryConfig:
     backoff: str = "exponential"
     retry_on: list[str] | None = None
     max_parse_recovery_attempts: int = 5
+
+
+# Cap on consecutive spawned-runtime restarts with no intervening successful
+# SDK call (issue #483). This is a death-loop guard, not a per-agent budget:
+# any successful agent-execution call resets the counter to 0 (see
+# ``_execute_with_retry``), so a long-running workflow that legitimately
+# restarts many times over hours is unaffected via that path — only a runtime
+# that dies again before ever succeeding trips the cap. Auxiliary paths that
+# also call ``_ensure_client_started`` (``validate_connection``,
+# ``execute_dialog_turn``, ``get_max_prompt_tokens``, ``get_model_pricing``,
+# ``list_models``, ``_validate_reasoning_effort_for_model``) can increment the
+# counter without resetting it on success.
+_MAX_CONSECUTIVE_RUNTIME_RESTARTS = 2
+
+
+def _is_broken_pipe_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` or any exception in its cause/context chain is a
+    ``BrokenPipeError`` or ``ConnectionResetError``.
+
+    The Copilot SDK's JSON-RPC write path can wrap the underlying OS error in
+    another exception type depending on the transport mode, so a bare
+    ``isinstance`` check on the top-level exception is not sufficient — the
+    chain must be walked. Module-level and pure so it is unit-testable
+    without constructing a provider.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (BrokenPipeError, ConnectionResetError)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
 
 
 @dataclass
@@ -385,6 +419,13 @@ class CopilotProvider(AgentProvider):
         self._mcp_servers = mcp_servers or {}
         self._started = False
         self._start_lock = asyncio.Lock()
+        # Consecutive spawned-runtime restarts with no intervening successful
+        # SDK call. Reset to 0 on every successful call in
+        # ``_execute_with_retry``; see ``_MAX_CONSECUTIVE_RUNTIME_RESTARTS``.
+        self._consecutive_runtime_restarts = 0
+        # Guards a one-time warning when a spawned, started client has no
+        # ``_cli_process`` handle (see ``_spawned_runtime_process``).
+        self._warned_missing_runtime_handle = False
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
@@ -898,6 +939,11 @@ class CopilotProvider(AgentProvider):
                     custom_agents=custom_agents,
                     extra_mcp_servers=extra_mcp_servers,
                 )
+                # A successful SDK call resets the consecutive-restart budget
+                # (issue #483, Q2): the counter only bounds a death loop where
+                # the runtime dies again before ever succeeding, not restarts
+                # spread across a long, otherwise-healthy run.
+                self._consecutive_runtime_restarts = 0
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
                 output_tokens = sdk_response.output_tokens if sdk_response else None
@@ -1484,9 +1530,21 @@ class CopilotProvider(AgentProvider):
             finally:
                 # Disconnect session unless it was kept alive for follow-up
                 if not session_destroyed:
-                    await session.disconnect()
+                    try:
+                        await session.disconnect()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "Failed to disconnect Copilot session for agent '%s' during "
+                            "cleanup; continuing.",
+                            agent.name,
+                            exc_info=True,
+                        )
 
-        except ProviderError:
+        except ProviderError as e:
+            if e.is_retryable and self._runtime_is_dead():
+                raise self._runtime_unavailable_error(e) from e
             raise
         except ValidationError:
             # Deterministic failures: a configuration error (e.g. unsupported
@@ -1495,7 +1553,11 @@ class CopilotProvider(AgentProvider):
             # the agent, so surface unwrapped rather than letting the retry
             # loop mask it.
             raise
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise self._runtime_unavailable_error(e) from e
         except Exception as e:
+            if _is_broken_pipe_error(e):
+                raise self._runtime_unavailable_error(e) from e
             raise ProviderError(
                 f"Copilot SDK call failed: {e}",
                 suggestion="Check that copilot CLI is installed and authenticated",
@@ -2382,6 +2444,15 @@ class CopilotProvider(AgentProvider):
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
+                if self._runtime_is_dead():
+                    # The runtime died between the last activity and this
+                    # recovery attempt (issue #483 root cause #3): without
+                    # this check the dead process would burn every recovery
+                    # attempt and eventually be reported as a stuck *agent*
+                    # rather than a dead *process*.
+                    raise self._runtime_unavailable_error(
+                        RuntimeError("Copilot runtime process is not running")
+                    ) from None
                 await session.send(recovery_prompt)
 
                 # Reset the done event to wait again — but only if it hasn't
@@ -2395,6 +2466,12 @@ class CopilotProvider(AgentProvider):
         Uses a lock to prevent concurrent agents (parallel groups or
         for-each iterations) from racing to start the same client
         subprocess multiple times.
+
+        Also detects a spawned runtime that has died (issue #483) and
+        rebuilds the client before returning. This check runs inside the
+        lock, so it double-checks correctly under concurrency: the first
+        waiter to observe a dead runtime rebuilds it, and any waiter that
+        arrives after that rebuild sees a live child and does nothing.
         """
         async with self._start_lock:
             if self._client is None:
@@ -2407,6 +2484,176 @@ class CopilotProvider(AgentProvider):
                 # BlockingIOError on large payloads. The asyncio event loop
                 # may set O_NONBLOCK on inherited file descriptors.
                 self._fix_pipe_blocking_mode()
+            elif self._runtime_is_dead():
+                await self._restart_spawned_runtime()
+
+    def _spawned_runtime_process(self) -> subprocess.Popen[bytes] | None:
+        """Return the subprocess this provider owns and spawned, else None.
+
+        Returns ``None`` (rather than guessing) for every mode where this
+        provider does not own the runtime's lifecycle:
+
+        - An externally-owned runtime (``runtime_url`` /
+          ``COPILOT_PROVIDER_RUNTIME_URL``) — Conductor's own authoritative
+          gate, preferred over the SDK-private ``_is_external_server``.
+        - No client constructed yet.
+        - The SDK's in-process FFI runtime mode, which has no OS child
+          process (``_cli_process`` absent, or not a real
+          ``subprocess.Popen``). The ``isinstance`` check also protects test
+          doubles that stand in for the client without a real subprocess —
+          only a genuine spawned-runtime handle is ever treated as live.
+        """
+        if self._resolve_runtime_connection() is not None:
+            return None
+        if self._client is None:
+            return None
+        # ``_cli_process`` is the spawned-child handle (a real OS process,
+        # None for URI and FFI connections). This is deliberately distinct
+        # from ``_fix_pipe_blocking_mode``'s ``_process``, which is the
+        # transport handle instead (a ``SocketWrapper`` in TCP mode, an
+        # ``_FfiProcessAdapter`` with its own ``poll()`` in FFI mode) --
+        # unifying the two reads onto ``_process`` would make FFI mode look
+        # like a killable child process.
+        process = getattr(self._client, "_cli_process", None)
+        if not isinstance(process, subprocess.Popen):
+            # We spawned something (not external, client built and started),
+            # so a handle should exist. The one benign explanation is FFI
+            # in-process mode, which has no OS child process at all; anything
+            # else here is a capability regression (e.g. an SDK rename of
+            # ``_cli_process``) that would otherwise silently disable
+            # dead-runtime recovery with no diagnostic.
+            if self._started and not self._warned_missing_runtime_handle:
+                self._warned_missing_runtime_handle = True
+                logger.warning(
+                    "Spawned Copilot runtime has no usable _cli_process handle. "
+                    "This is expected in FFI in-process mode; otherwise it may "
+                    "indicate an incompatible Copilot SDK version, which would "
+                    "silently disable dead-runtime restart recovery (issue #483)."
+                )
+            return None
+        return process
+
+    def _runtime_is_dead(self) -> bool:
+        """Return True only when a spawned runtime's child process has exited.
+
+        Returns False ("not known dead") for external runtimes, in-process
+        FFI mode, and a client that has not started yet, so no non-spawned
+        mode can ever trigger a restart.
+        """
+        process = self._spawned_runtime_process()
+        return process is not None and process.poll() is not None
+
+    def _runtime_unavailable_error(self, exc: BaseException) -> ProviderError:
+        """Build the error for a dead/unreachable Copilot runtime.
+
+        Forks on whether this provider connects to an externally-owned
+        runtime or spawns its own (issue #483, Q1): a broken connection to
+        an external runtime is never retried or respawned here — the
+        orchestrator that owns it is responsible for health checks and
+        restarts (docs/configuration.md). A broken connection to a runtime
+        this provider spawned is retryable: the next attempt's
+        ``_ensure_client_started`` will rebuild it.
+        """
+        connection = self._resolve_runtime_connection()
+        if connection is not None:
+            url, _token = connection
+            return ProviderError(
+                f"The external Copilot runtime at {url} is unreachable (broken connection).",
+                suggestion=(
+                    "This runtime is owned by an external orchestrator, which is "
+                    "responsible for its health checks and restarts. Verify the "
+                    "runtime process is still running and reachable at that address."
+                ),
+                is_retryable=False,
+            )
+
+        process = self._spawned_runtime_process()
+        exit_code = process.poll() if process is not None else None
+        if exit_code is not None:
+            return ProviderError(
+                f"The Copilot runtime process died (exit code {exit_code}): {exc}",
+                suggestion=(
+                    "The nested Copilot runtime will be restarted automatically on the "
+                    "next attempt. If this recurs, it may indicate the runtime process "
+                    "is running out of memory; try setting "
+                    'NODE_OPTIONS="--max-old-space-size=8192" in the environment running '
+                    "conductor."
+                ),
+                is_retryable=True,
+            )
+
+        return ProviderError(
+            f"The connection to the Copilot runtime broke: {exc}",
+            suggestion=(
+                "The runtime process is still running, so this was a transport "
+                "failure rather than a crash. The connection will be re-established "
+                "automatically on the next attempt."
+            ),
+            is_retryable=True,
+        )
+
+    async def _restart_spawned_runtime(self) -> None:
+        """Rebuild the Copilot client after detecting a dead spawned runtime.
+
+        Must be called while holding ``self._start_lock``. Checks the
+        consecutive-restart cap (reset on any successful SDK call, see
+        ``_execute_with_retry``) before incrementing it and fails fast if a
+        runtime keeps dying before ever succeeding, rather than looping
+        forever.
+        """
+        if self._consecutive_runtime_restarts >= _MAX_CONSECUTIVE_RUNTIME_RESTARTS:
+            raise ProviderError(
+                "The Copilot runtime process died and was restarted "
+                f"{_MAX_CONSECUTIVE_RUNTIME_RESTARTS} times in a row without a "
+                "single successful call. Giving up rather than restarting again.",
+                suggestion=(
+                    "Check the runtime for a crash loop (e.g. persistent OOM). Try "
+                    'setting NODE_OPTIONS="--max-old-space-size=8192" in the '
+                    "environment running conductor."
+                ),
+                is_retryable=False,
+            )
+
+        self._consecutive_runtime_restarts += 1
+
+        old_process = self._spawned_runtime_process()
+        old_exit_code = old_process.poll() if old_process is not None else None
+        logger.warning(
+            "Copilot runtime process died (exit code %s); restarting it "
+            "(consecutive restart %d/%d).",
+            old_exit_code,
+            self._consecutive_runtime_restarts,
+            _MAX_CONSECUTIVE_RUNTIME_RESTARTS,
+        )
+
+        # Best-effort teardown of the dead client. stop() attempts a graceful
+        # RPC shutdown plus process-exit waits against a corpse, so it is
+        # bounded rather than allowed to hang recovery. Failures are logged
+        # rather than silently swallowed: a StopError here means a runtime
+        # child survived both terminate and kill, i.e. a leaked process.
+        try:
+            await asyncio.wait_for(self._client.stop(), timeout=10.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Teardown of the dead Copilot client failed; continuing with the "
+                "restart. A runtime child process may have been leaked.",
+                exc_info=True,
+            )
+
+        # Invalidate the old client before rebuilding: if the new client's
+        # start() raises (e.g. OOM at spawn), we must not be left believing
+        # a never-started client is started, which would silently skip
+        # recovery on the next call.
+        self._client = None
+        self._started = False
+
+        new_client = self._build_client()
+        await new_client.start()
+        self._client = new_client
+        self._started = True
+        self._fix_pipe_blocking_mode()
 
     def _build_client(self) -> Any:
         """Construct the Copilot SDK client.
@@ -2760,6 +3007,7 @@ class CopilotProvider(AgentProvider):
                 await self._client.stop()
         self._client = None
         self._started = False
+        self._consecutive_runtime_restarts = 0
         self._call_history.clear()
         self._retry_history.clear()
 
