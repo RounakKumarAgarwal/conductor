@@ -5340,10 +5340,11 @@ class WorkflowEngine:
             # library, fatal runtime errors). Without this arm the silent
             # Windows startup crash (#116) leaves no ``workflow_failed``
             # event in the JSONL log, making the failure invisible.
-            # Windows startup crash (#116) leaves no ``workflow_failed``
-            # event in the JSONL log, making the failure invisible.
-            # The diagnostic side effects below (``_emit``,
-            # ``_save_checkpoint_on_failure``) are wrapped in their own
+            #
+            # Consumers that need notification for ``BaseException``
+            # failures should subscribe to ``workflow_failed`` and check
+            # the ``is_base_exception`` flag set below.
+            #
             # The diagnostic side effects below (``_emit``,
             # ``_save_checkpoint_on_failure``) are wrapped in their own
             # ``try/except`` blocks: if either of them raised here, the

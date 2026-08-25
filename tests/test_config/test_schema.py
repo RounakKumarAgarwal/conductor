@@ -539,7 +539,7 @@ class TestHooksRemoved:
             )
         message = str(exc_info.value)
         assert "hooks" in message
-        assert "extra_forbidden" in message
+        assert "#476" in message
 
 
 class TestAgentDef:

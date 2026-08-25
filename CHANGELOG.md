@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
 
-
 ### Removed
 
 - **Dead workflow lifecycle hooks (`on_start` / `on_complete` / `on_error`)**
@@ -22,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   syntax will be designed against a concrete requirement (emitting an event,
   invoking a `type: script` step, or calling a webhook) rather than rendering a
   template and throwing it away.
+
 ### Added
 
 - **Native OpenAI provider** — new stable `openai` provider built on the shared
